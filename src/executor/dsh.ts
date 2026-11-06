@@ -251,7 +251,10 @@ export class DshExecutor implements Executor {
     const env = Object.fromEntries(this.host.environment(ticket).map(variable => [variable.key, variable.value]))
     // Enforce a timeout so a hung prepare command (such as on a credential prompt) fails the ticket instead of holding a worker slot indefinitely.
     const signal = AbortSignal.any([this.host.lifetime, AbortSignal.timeout(PREPARE_TIMEOUT_MS)])
-    if (command) await runAsWorker(this.host.context.subprocess, ['sh', '-c', command], dirname(directory), signal, env)
+    // A prepare command is shell text: POSIX installations run it with `sh`, Windows ones with PowerShell 7, whose syntax the
+    // panel's hint and docs/006-deployment.md describe per platform (Windows reads a variable as `$env:NAME`).
+    const shell = process.platform === 'win32' ? ['pwsh', '-NoProfile', '-Command'] : ['sh', '-c']
+    if (command) await runAsWorker(this.host.context.subprocess, [...shell, command], dirname(directory), signal, env)
       .catch(async (error: unknown) => {
         // Remove an empty directory left by a failed prepare command so a later retry does not treat it as already prepared.
         await rmdir(directory).catch(() => { /* Absent, or holding what the command wrote, which the output explains. */ })

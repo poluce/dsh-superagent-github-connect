@@ -26,6 +26,17 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
 - For Feishu: `lark-cli` (tested with 1.0.90) and a Feishu or Lark app with a bot
 
+### Windows
+
+Windows is supported for setup, the worker environment and the prepare command. The `scripts/dsh-superagent` service script, tmux, and the hourly check that uses them are still POSIX-only; a Node-based service script that replaces tmux is planned. On Windows:
+
+- **Prerequisites** are the same except tmux and Python: Node.js 22.19+ or 24+, pnpm, git 2.32+, GitHub CLI 2.48+, and PowerShell 7 (`pwsh`) for prepare commands.
+- **Command shims are `.cmd` files.** `worker-bin` holds `gh.cmd`, `lark-cli.cmd` and one `<command>.cmd` per blocked command. Windows starts a process only from an executable image or a `.bat`/`.cmd` script and ignores an extensionless script, so a POSIX `#!/bin/sh` shim would silently do nothing and a worker's `gh` would run as the operator's own account instead of the agent's. dsh-superagent rewrites these files on every start; do not edit or replace them.
+- **Account CLIs** must be `.exe`, `.cmd` or `.bat` files on `PATH` or absolute paths. The host resolves a command name through `PATHEXT`, so a configured `gh` resolves to `gh.exe`, and it runs a `.cmd` CLI through `cmd.exe`.
+- **The credential helper** in the isolated git configuration is `!'C:\…' auth git-credential`; Git for Windows' `sh` parses it with paths that hold spaces and backslashes (checked with git 2.50).
+- **Prepare commands run with `pwsh -NoProfile -Command`** instead of `sh -c`. They read the execution environment as `$env:DSH_SUPERAGENT_DIR` and use PowerShell syntax, as the Execution setting below shows.
+- **File permissions differ.** The POSIX modes (0700 for the state directory, 0600 for the database) are not enforced; access follows the directory's NTFS ACL, inherited from the account that runs dsh-superagent. For isolation, use a dedicated Windows account with only the agent's credentials, as Permissions and isolation above describes.
+
 ## Accounts
 
 ### Agent GitHub account
@@ -46,6 +57,16 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
    Sign in as the agent account; the last command prints its login. dsh-superagent reads the login the same way.
 
+   On Windows, write the wrapper as a `.cmd` file and name that file in the Source's CLI field:
+
+   ```bat
+   @echo off
+   set "GH_CONFIG_DIR=%USERPROFILE%\.config\gh-agent"
+   call gh %*
+   ```
+
+   A `.cmd` wrapper is required because Windows does not run a `#!/bin/sh` script; an extensionless wrapper would be skipped and `gh` would run as the operator's own account.
+
 ### Feishu bot (optional)
 
 1. Create a self-built app with the bot capability. Grant it the permissions to receive message events, read and send chat messages, and read chat members, then publish the app version.
@@ -63,6 +84,14 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
    ```
 
    The first command reads the app secret from standard input. Use a separate configuration directory: `lark-cli` allows one profile per app id, and your personal configuration may already contain a user login for that app.
+
+   On Windows the wrapper is `lark-bot.cmd`:
+
+   ```bat
+   @echo off
+   set "LARKSUITE_CLI_CONFIG_DIR=%USERPROFILE%\.lark-cli-dsh-superagent"
+   call lark-cli %*
+   ```
 
    The host refuses a CLI that can act as a user. It reads the app id, Feishu/Lark brand and bot `open_id` from the bot configuration.
 
@@ -105,6 +134,8 @@ scripts/dsh-superagent status
 ```
 
 `start` runs `dsh --profile superagent` in tmux session `dsh-superagent`, or `dsh-<profile>` for another profile. It waits up to one minute for the runtime to become ready or report a setup requirement. On a first run it prints the missing setup information. It refuses duplicate instances, including ones started outside this script.
+
+On Windows the service script and tmux are not available yet: run `dsh --profile superagent` in a terminal, or under a Windows service wrapper that restarts it, and read the setup problems from its log and the panel. The hourly check below needs `scripts/dsh-superagent`, so on Windows watch the panel instead until the Node-based service script replaces it.
 
 `stop` and `restart` request graceful shutdown and wait up to five minutes for Executors. They never force-kill the process or touch other tmux sessions.
 
@@ -151,6 +182,13 @@ Setup must succeed before polling or work starts. Overview lists missing require
    ```sh
    git -C /home/me/src/widgets fetch --no-tags "https://github.com/$DSH_SUPERAGENT_GITHUB_REPOSITORY.git" "${DSH_SUPERAGENT_GITHUB_PR_HEAD:-HEAD}:refs/dsh-superagent/$DSH_SUPERAGENT_TICKET" &&
    git -C /home/me/src/widgets worktree add -b "agent/$DSH_SUPERAGENT_NAME" "$DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$DSH_SUPERAGENT_TICKET"
+   ```
+
+   On Windows the prepare command runs with `pwsh -NoProfile -Command`, so the same checkout reads the variables with `$env:` and names the clone in PowerShell syntax:
+
+   ```powershell
+   git -C "$env:USERPROFILE\src\widgets" fetch --no-tags "https://github.com/$env:DSH_SUPERAGENT_GITHUB_REPOSITORY.git" "$($env:DSH_SUPERAGENT_GITHUB_PR_HEAD ?? 'HEAD'):refs/dsh-superagent/$env:DSH_SUPERAGENT_TICKET"
+   git -C "$env:USERPROFILE\src\widgets" worktree add -b "agent/$env:DSH_SUPERAGENT_NAME" "$env:DSH_SUPERAGENT_DIR" "refs/dsh-superagent/$env:DSH_SUPERAGENT_TICKET"
    ```
 
    List personal CLIs, such as one signed in to your own account, as blocked commands.
@@ -221,7 +259,7 @@ Setup verifies the GitHub repository and the agent's push access, writes the wor
 
 The process environment that setup writes:
 
-- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target.
+- **Command shims** in `<stateDir>/worker-bin`, first on `PATH`: `gh` runs the agent's CLI; `lark-cli` runs the bot's CLI; blocked commands fail. A shim removes its own directory from `PATH` before it runs its target. On Windows the files are `gh.cmd`, `lark-cli.cmd` and one `<command>.cmd` per blocked command, so `PATHEXT` resolves them and `cmd` runs them.
 - **git configuration** in `<stateDir>/worker-gitconfig`: replaces the operator's global and system git configuration. It selects the agent CLI as the github.com credential helper, rewrites GitHub SSH addresses to HTTPS and defines Git LFS filters. Personal git settings such as an HTTP proxy do not apply. No commit identity is set here, git never prompts for credentials, and `GH_TOKEN` and `GITHUB_TOKEN` are removed.
 
 A file in `worker-bin` or `worker-gitconfig` that dsh-superagent did not write stops setup. A Ticket directory inside a git repository whose own configuration adds credentials fails the Ticket.
@@ -235,7 +273,7 @@ From an allowed GitHub account, open an Issue or post a comment containing `@<ag
 1. Wait until no Executor is in the middle of a turn.
 2. Back up `<stateDir>/orchestrator.sqlite`.
 3. Run `git pull && pnpm install && pnpm build`.
-4. Run `scripts/dsh-superagent restart` and inspect its status.
+4. Run `scripts/dsh-superagent restart` and inspect its status. On Windows, stop and start the process you run instead.
 
 A restart ends running Assignments and starts replacements with recovery notes. Team text and overridden prompt parts are retained; parts without overrides follow the new defaults. Review parts marked **Default updated** after upgrading.
 
@@ -260,6 +298,7 @@ Setup problems appear on the overview with a link to the fix, in the panel's lan
 | `git does not read the github.com credential configuration dsh-superagent writes` | Install git 2.32 or later |
 | A Ticket fails with `The git configuration of the repository in … sets …` | Remove the named credential or `http.*.extraheader` settings from the clone's `.git/config` |
 | `… was not written by dsh-superagent` | Move the named file out of `<stateDir>/worker-bin` or `<stateDir>/worker-gitconfig`, or choose another `stateDir` |
+| A worker's `gh` acts as the operator's own account | On Windows, check that `<stateDir>/worker-bin` holds `gh.cmd` and that it comes first on the worker's `PATH`; an extensionless shim is ignored by Windows. Do not delete the `.cmd` files, which dsh-superagent rewrites on every start |
 | `The bot lark-cli allows user identities` | Point the Feishu Source at a bot-only configuration, as in Feishu bot above |
 | `The bot lark-cli does not work.` or `The bot identity of app … is …` | Check the configuration's app id and secret |
 | `The Feishu bot is not a member of the chat.` | Add the bot to the chat in the chat's settings; the next attempt succeeds |
