@@ -23,6 +23,7 @@ import { SetupError, type SetupProblem } from '../src/setup.ts'
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const MEMBER = 'ou_alice'
 function host(overrides: Partial<SourceContextDeps> = {}) {
@@ -1212,9 +1213,10 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
     observePulls: false, observeComments: false, observeCi: false })
 })
-// The fake bot CLI is a POSIX shell script, so this group cannot run on Windows; the loops it drives are covered there by
-// the unit tests above, which take the same functions without spawning a process.
-describe.skipIf(process.platform === 'win32')('feishu event consumer', () => {
+// The consumer spawns its bot CLI as a process, which Windows can start only from an executable image, so each test writes
+// a launcher for the platform: a `.cmd` running the fake bot through the Node that runs the tests, or a `sh` script that
+// execs it. Both drive the same fake, so every case here runs on either platform.
+describe('feishu event consumer', () => {
   let dir: string
   let controller: AbortController
   let running: Promise<unknown> | undefined
@@ -1227,24 +1229,23 @@ describe.skipIf(process.platform === 'win32')('feishu event consumer', () => {
     vi.useRealTimers()
     rmSync(dir, { recursive: true, force: true })
   })
+  /** The fake bot both launchers run; it prints what a real bot prints and stays up until the consumer stops it. */
+  const bot = fileURLToPath(new URL('./fixtures/feishu-bot.mjs', import.meta.url))
   /**
    * A bot CLI whose `event consume` behaves as `mode` says: `never` gets ready, `warn` warns once ready, `ready` stays up,
-   * and `flaky` exits after its first ready. It records each run and the PID of the latest.
+   * `flaky` exits after its first ready, `events` prints the event lines, and `late` prints them a second later. It
+   * records each run and the PID of the latest.
    */
   function cli(mode: 'never' | 'warn' | 'ready' | 'flaky' | 'events' | 'late'): string {
-    const path = join(dir, 'lark-bot')
-    writeFileSync(path, `#!/bin/sh
-  [ "$1" = event ] || { echo '{"ok":true,"data":{}}'; exit 0; }
-  n=$(cat '${dir}/runs' 2>/dev/null || echo 0); n=$((n + 1)); echo $n > '${dir}/runs'; echo $$ > '${dir}/pid'
-  case ${mode} in
-    never) exec sleep 60 ;;
-    warn) echo '[event] ready' >&2; echo 'WARN the connection was reset' >&2; exec sleep 60 ;;
-    ready) echo '[event] ready' >&2; exec sleep 60 ;;
-    flaky) echo '[event] ready' >&2; [ "$n" -gt 1 ] && exec sleep 60; exit 1 ;;
-    events) echo '[event] ready' >&2; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
-    late) echo '[event] ready' >&2; sleep 1; cat '${dir}/events'; touch '${dir}/printed'; exec sleep 60 ;;
-  esac
-  `, { mode: 0o755 })
+    const fixed = [mode, dir].map(argument => ` "${argument}"`).join('')
+    // A batch file is quoted for `cmd.exe`, which the consumer starts it through; a shell script runs the bot in place, so
+    // the process the consumer stops is the one that recorded its PID.
+    const windows = process.platform === 'win32'
+    const path = join(dir, windows ? 'lark-bot.cmd' : 'lark-bot')
+    const script = windows
+      ? `@echo off\r\n"${process.execPath}" "${bot}"${fixed} %*\r\n`
+      : `#!/bin/sh\nexec "${process.execPath}" "${bot}"${fixed} "$@"\n`
+    writeFileSync(path, script, { mode: 0o755 })
     return path
   }
   const runs = () => existsSync(join(dir, 'runs')) ? Number(readFileSync(join(dir, 'runs'), 'utf8')) : 0
