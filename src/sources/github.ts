@@ -5,7 +5,7 @@ import { sameName } from '../infra/text.ts'
 import { GithubAccountsSchema } from '../deployment.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
 import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
-import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
+import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, githubCommentAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
   from './github-trigger.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
 import type { GithubComment, PullRef } from './github-trigger.ts'
@@ -151,10 +151,12 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 interface Round {
   started: string; signal?: AbortSignal | undefined; interval: number
   pulls: Map<number, Promise<Pull>>; read: Set<number>; failures: string[]; dropped: number[]; abandoned: number[]
+  /** Streams whose stored cursor was older than the polling horizon, so history before the horizon was not read. */
+  clamped: string[]
   tally: Tally
 }
 const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, interval: 0, pulls: new Map(),
-  read: new Set(), failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
+  read: new Set(), failures: [], dropped: [], abandoned: [], clamped: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
 export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
 const RETRY_WINDOW_MS = 24 * 3600_000
@@ -245,6 +247,8 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
   const before = typeof stored?.started === 'object' ? stored.started : {}
   const started: Record<string, string> = Object.fromEntries(kinds.map(kind => [kind, before[kind] ?? round.started]))
   const horizon = Math.floor((Date.parse(round.started) - POLL_HORIZON_MS) / 3_600_000) * 3_600_000
+  // A cursor behind the horizon loses the history before it; the round names that stream so the loss is not silent.
+  if (Date.parse(stored?.since ?? round.started) < horizon) round.clamped.push(id)
   const since = new Date(Math.max(Date.parse(stored?.since ?? round.started), horizon)).toISOString()
   const conditional = stored?.etag && stored.since === since ? ['-H', `If-None-Match: ${stored.etag}`] : []
   let raw: string
@@ -328,10 +332,13 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   if (signal?.aborted) return Math.max(interval, round.interval)
   if (round.failures.length) throw new Error(`${round.failures.length} GitHub reads failed: ${round.failures.slice(0, 3).join('; ')}`)
   const named = (numbers: number[]) => [...new Set(numbers)].sort((a, b) => a - b).map(number => `#${number}`).join(', ')
+  const day = POLL_HORIZON_MS / 86_400_000
   const dropped = (round.dropped.length ? `; deleted on GitHub: ${named(round.dropped)}` : '')
     + (round.abandoned.length ? `; dropped after their reads kept failing: ${named(round.abandoned)}` : '')
     + (round.tally.skipped ? `; ${round.tally.skipped} unreadable items skipped` : '')
-    + (unreadable ? `; ${unreadable} notifications of threads this Source does not read` : '')
+    + (unreadable ? `; ${unreadable} notification${unreadable === 1 ? '' : 's'} of threads this Source does not read` : '')
+    // A cursor further back than the horizon means older events exist that were not read; name the streams instead of losing them silently.
+    + (round.clamped.length ? `; history before the ${day}-day window not read: ${[...new Set(round.clamped)].join(', ')}` : '')
   ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${Math.max(interval, round.interval)}s${dropped}`, at: round.started })
   return Math.max(interval, round.interval)
 }
@@ -362,10 +369,12 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     if (!sameName(notification.repository.full_name, repository)) continue
     const url = notification.subject.url ?? ''
     if (!url) continue
-    const address = githubAddress(url, repository)
-    // GitHub names some threads (commits, releases, review comment threads) by addresses this Source cannot read an Issue
-    // or PR from; they are counted and named in the health detail instead of being dropped silently.
-    if (!address || address.discussion) { unreadable += 1; continue }
+    // `issues|pulls/<n>` names a thread, a `#discussion_r` fragment names a review comment on one, and
+    // `pulls|issues/comments/<id>` names only the comment, whose read tells the Issue or PR it belongs to.
+    const address = githubAddress(url, repository) ?? await commentThread(ctx, round, githubCommentAddress(url, repository))
+    // GitHub also names threads this Source cannot read an Issue or PR from (commits, releases); they are counted and
+    // named in the health detail instead of being dropped silently.
+    if (!address) { unreadable += 1; continue }
     if (items.has(address.number)) continue
     const { number, pr } = address
     items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
@@ -388,6 +397,23 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
   }
   ctx.atomic(() => { state.set(KV.github.since, cursorAt(round.started)); state.set(KV.github.retries, retries) })
   return { count: notifications.length, interval, unreadable }
+}
+/** Reads a comment a notification names and returns the Issue or PR it belongs to; undefined when the comment is gone. */
+async function commentThread(ctx: SourceContext, round: Round,
+  named: { kind: 'issues' | 'pulls'; id: number } | undefined): Promise<{ number: number; pr: boolean } | undefined> {
+  if (!named) return undefined
+  try {
+    const comment = await ctx.commands.withSignal(round.signal)
+      .api(z.looseObject({ html_url: z.string().nullish(), issue_url: z.string().nullish(), pull_request_url: z.string().nullish() }),
+        `${named.kind}/comments/${named.id}`)
+    const address = githubAddress(comment.html_url ?? comment.pull_request_url ?? comment.issue_url ?? '', ctx.deployment.repository)
+    return address ? { number: address.number, pr: address.pr || named.kind === 'pulls' } : undefined
+  } catch (error) {
+    // A comment that is gone cannot name a thread; another failure (network, rate limit) fails the round, whose cursor then
+    // stays put so the notification is read again next round instead of being dropped.
+    if (error instanceof CliError && (error.code === 404 || error.code === 410)) return undefined
+    throw error
+  }
 }
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {
   const { since } = item
@@ -429,14 +455,44 @@ function pull(ctx: SourceContext, round: Round, number: number): Promise<Pull> {
   }
   return read
 }
+/**
+ * Reads the reviews of a PR since `since`. GitHub lists reviews oldest first and offers no `since` filter, so instead of
+ * paging the whole history every round this reads the last page (found in the Link header) and walks back until a page
+ * holds a review from before the cursor: a new review can only appear in the last page, so nothing newer is missed.
+ */
+async function readReviews(ctx: SourceContext, round: Round, number: number, since: string): Promise<GithubComment[]> {
+  const commands = ctx.commands.withSignal(round.signal)
+  const path = `pulls/${number}/reviews?per_page=100`
+  const raw = await commands.api(path, '--include')
+  const { headers, body } = included(raw)
+  // A list GitHub answers while it wants the caller to slow down pushes the whole round back, not only this read.
+  round.interval = Math.max(round.interval, rateLimitSeconds(headers) ?? 0)
+  const last = Number(/[?&]page=(\d+)>;\s*rel="last"/i.exec(headers)?.[1] ?? 1)
+  const page = async (index: number): Promise<GithubComment[]> => {
+    const text = index === 1 ? body : await commands.api(`${path}&page=${index}`)
+    return validItems(CommentSchema, z.array(z.unknown()).parse(JSON.parse(text)), round.tally)
+  }
+  const pages: GithubComment[][] = []
+  for (let index = Number.isFinite(last) && last >= 1 ? last : 1; index >= 1; index -= 1) {
+    const reviews = await page(index)
+    pages.unshift(reviews)
+    const read = reviews.some(review => Date.parse(review.updated_at ?? review.submitted_at ?? review.created_at ?? '') < Date.parse(since))
+    if (read) break
+  }
+  return pages.flat()
+}
 async function intakeComments(ctx: SourceContext, ref: PullRef, since: string, round: Round): Promise<void> {
   const commands = ctx.commands.withSignal(round.signal)
   const { login } = ctx.deployment.github
   const kinds = ref.isPr ? ['conversation', 'inline', 'review'] as const : ['conversation'] as const
   for (const kind of kinds) {
     const suffix = `&since=${encodeURIComponent(since)}`
-    const path = kind === 'conversation' ? `issues/${ref.number}/comments?per_page=100${suffix}` : kind === 'inline' ? `pulls/${ref.number}/comments?per_page=100${suffix}` : `pulls/${ref.number}/reviews?per_page=100`
-    const comments = await commands.pages(CommentSchema, path, round.tally)
+    const path = `issues/${ref.number}/comments?per_page=100${suffix}`
+    // Conversation and inline comments filter by `since` on GitHub's side; reviews have no such filter, so they are read
+    // from their newest page back instead of paging all of them every round.
+    const comments = kind === 'conversation' ? await commands.pages(CommentSchema, path, round.tally)
+      : kind === 'inline' ? await commands.pages(CommentSchema, `pulls/${ref.number}/comments?per_page=100${suffix}`, round.tally)
+        : await readReviews(ctx, round, ref.number, since)
     for (const comment of comments) {
       // Stopping mid-read throws so the thread's cursor stays where it was.
       if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')

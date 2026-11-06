@@ -10,6 +10,10 @@ import { actorName, localized, readableMarkers, reasonLabel, valueLabel, when } 
 import { ActionLink, ConfirmButton, ExternalLink, Hint, KeyValues, LabelValue, LoadState, MarkdownLite, PageHead, Section, SessionButton,
   StageMark, When } from './widgets.tsx'
 
+/** The icon of a Source's Channel link; a Source without one of its own keeps the neutral message icon. */
+const CHANNEL_ICONS: Partial<Record<string, IconName>> = { github: 'pull', feishu: 'message' }
+export const channelIcon = (source: string): IconName => CHANNEL_ICONS[source] ?? 'message'
+
 type Input = TicketPageView['inputs'][number]
 function InputLine({ input, earlier = [] }: { input: Input; earlier?: { id: string; at: string; preview: string }[] }) {
   const { t, navigate } = usePanel()
@@ -175,7 +179,7 @@ export function TicketPage({ id }: { id: string }) {
       </Details>}
       <Details icon="message" title={t('term.channel')}>
         <ul className="dt-plain-list">{data.channels.map((item, index) => <li key={index}>
-          <ExternalLink href={item.url} icon={item.source === 'github' ? 'pull' : 'message'}>{localized(t, item.label)}</ExternalLink>
+          <ExternalLink href={item.url} icon={channelIcon(item.source)}>{localized(t, item.label)}</ExternalLink>
         </li>)}</ul>
       </Details>
       {data.inputs.length > undelivered.length && <Details icon="inbox" title={t('deliveredInputs',

@@ -2,6 +2,7 @@
 import { z } from 'zod'
 import type { Trigger } from '../core/index.ts'
 import { validItems, type Commands } from '../infra/commands.ts'
+import type { SourceCommands } from './commands.ts'
 import { admissionImageKeys, readAdmissionImage } from './feishu-image.ts'
 import { feishuRef, feishuTime, HistoricalMessageSchema, HistoryPageSchema, historyText, withMentionNames, type HistoricalMessage }
   from './feishu-trigger.ts'
@@ -51,7 +52,7 @@ export function feishuResource(resource: string) {
   }
   return { triggerId: match[1]!, section: match[2]!, cursor: match[3] ? decodeURIComponent(match[3]) : undefined }
 }
-async function sourceOf(commands: Commands, ref: FeishuRef) {
+async function sourceOf(commands: SourceCommands, ref: FeishuRef) {
   const id = messageId.parse(ref.messageId)
   // Use the raw mget endpoint to read parent/root IDs without triggering CLI thread expansion.
   const params = JSON.stringify({ message_ids: [id] })
@@ -63,10 +64,12 @@ async function sourceOf(commands: Commands, ref: FeishuRef) {
   return source
 }
 
-export interface FeishuPage<M> { status: string; thread_id?: string; messages: M[]; next_resource: string | null; skipped?: number }
+export interface FeishuPage<M> { status: string; thread_id?: string; messages: M[]; next_resource: string | null; skipped?: number
+  /** Why this page is not all of what Feishu has, when it said more exists but gave no page to read it with. */
+  note?: string }
 export interface FeishuOne<M> { status: string; message: M | null }
 /** Fetches one message or a bounded topic page of a Trigger's source message with explicit pagination continuation. */
-export async function readFeishu(commands: Commands, ref: FeishuRef, resource: string, pageSize: number,
+export async function readFeishu(commands: SourceCommands, ref: FeishuRef, resource: string, pageSize: number,
   order: 'asc' | 'desc' = 'asc'): Promise<FeishuPage<FeishuMessage> | FeishuOne<FeishuMessage>> {
   const request = feishuResource(resource)
   if (request.triggerId !== ref.triggerId) throw new Error('A Feishu source trigger is required')
@@ -112,7 +115,7 @@ function historyView(message: HistoricalMessage): ContextMessage {
     ...message.parent_id ? { reply_to: message.parent_id } : {}, ...message.message_app_link ? { url: message.message_app_link } : {} }
 }
 /** Reads chat messages surrounding `ref.at` (five before and five after on initial read, then pages of ten older messages). */
-async function chatAround(commands: Commands, ref: FeishuRef, cursor: string | undefined, before = 5,
+async function chatAround(commands: SourceCommands, ref: FeishuRef, cursor: string | undefined, before = 5,
   after = 5): Promise<FeishuPage<ContextMessage>> {
   const time = Date.parse(ref.at ?? '')
   if (!Number.isFinite(time)) throw new Error('The source Feishu message has no time to read the chat around')
@@ -130,10 +133,14 @@ async function chatAround(commands: Commands, ref: FeishuRef, cursor: string | u
   const messages = [...earlier.items.reverse(), ...later].filter(item => !seen.has(item.message_id) && seen.add(item.message_id))
     .map(historyView)
   const more = earlier.has_more && earlier.page_token && earlier.page_token !== cursor
+  // Feishu reports earlier messages but gives no page to read them with, or the same one again: return the messages it did
+  // send with a status that says they are only part of the range, instead of ending the page as if it were complete.
+  const stalled = earlier.has_more && !more
   const next = more ? `feishu/${ref.triggerId}/around/${encodeURIComponent(earlier.page_token!)}` : null
-  return { status: 'available', messages, next_resource: next }
+  return { status: stalled ? 'truncated' : 'available', messages, next_resource: next,
+    ...stalled ? { note: 'Feishu reported more chat messages before this page without a page to continue from, so these are only the messages it returned' } : {} }
 }
-export async function feishuRead(commands: Commands, ref: FeishuRef, resource: string,
+export async function feishuRead(commands: SourceCommands, ref: FeishuRef, resource: string,
   pageSize: number): Promise<FeishuPage<ContextMessage> | FeishuOne<ContextMessage>> {
   const request = feishuResource(resource)
   if (request.section === 'around') {

@@ -11,10 +11,18 @@ export const feishuChannel = (chatId: string, messageId: string, direct = false)
 const EventSchema = z.object({ message_id: z.string(), chat_id: z.string(), chat_type: z.enum(['p2p', 'group']),
   sender_id: z.string(), sender_type: z.enum(['user', 'bot']), content: z.string(), create_time: z.string(),
   mentions: z.array(z.object({ id: z.string(), key: z.string().optional(), name: z.string().optional() })).default([]),
-  root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(), message_app_link: z.url().optional() })
+  root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(), message_app_link: z.url().optional(),
+  // An edit is delivered by the history and topic reads, which see the message again with `updated` set and its update time.
+  update_time: z.string().optional(), updated: z.boolean().optional() })
 export type FeishuEvent = z.infer<typeof EventSchema>
 export const feishuThreadId = (chatId: string, rootId: string | undefined, messageId: string): string => `${chatId}:${rootId ?? messageId}`
-/** Deterministic trigger ID for a Feishu message; every read path for this message produces the same ID. */
+/**
+ * Deterministic trigger ID for a Feishu message; every read path for this message produces the same ID.
+ * Unlike an edited GitHub comment, an edited Feishu message keeps its ID: the ID is the message's identity, so a reply
+ * still correlates with the message it answers (`feishuParent`), and the live consumer subscribes to new-message events,
+ * so an edit is not a new request. The edit is recorded in the Trigger's `meta.edited` instead, and a reader that needs
+ * the current text reads the Thread again, where Feishu returns the edited body.
+ */
 export const feishuTriggerId = (messageId: string): string => key('feishu', messageId)
 export const withMentionNames = (text: string, mentions: { key?: string | undefined; name?: string | undefined }[]): string =>
   mentions.reduce((result, mention) => mention.key && mention.name ? result.replaceAll(mention.key, `@${mention.name}`) : result, text)
@@ -27,6 +35,10 @@ export function feishuTime(value: string): string {
   if (!Number.isFinite(time)) throw new Error(`Unreadable Feishu message time: ${value}`)
   return new Date(time).toISOString()
 }
+/** A message's edit time when Feishu states it readably; an unreadable one leaves the edit marked without a time. */
+const editedTime = (value: string): string | undefined => {
+  try { return feishuTime(value) } catch { return undefined }
+}
 /** Converts a normalized Feishu event into a Trigger, returning undefined for messages sent by the bot itself. */
 export function feishuTrigger(input: unknown, botId: string, botAppId: string): Trigger | undefined {
   const event = EventSchema.parse(input)
@@ -34,13 +46,16 @@ export function feishuTrigger(input: unknown, botId: string, botAppId: string): 
   const direct = event.chat_type === 'p2p'
   const mentioned = event.mentions.some(mention => mention.id === botId || mention.id === botAppId)
   const thread = feishuThreadId(event.chat_id, event.root_id, event.message_id)
+  const editedAt = event.updated === true && event.update_time ? editedTime(event.update_time) : undefined
   return { id: feishuTriggerId(event.message_id), source: SOURCE, threads: [{ source: SOURCE, id: thread }],
     actor: { source: SOURCE, id: event.sender_id }, human: event.sender_type === 'user',
     ...(direct ? { addressed: 'direct' as const } : mentioned ? { addressed: 'mention' as const } : {}),
     at: feishuTime(event.create_time), text: withMentionNames(event.content, event.mentions),
     channel: feishuChannel(event.chat_id, event.message_id, direct), ...(event.message_app_link ? { url: event.message_app_link } : {}),
     meta: { chatId: event.chat_id, messageId: event.message_id, direct, mentioned, ...(event.root_id ? { rootId: event.root_id } : {}),
-      ...(event.parent_id ? { parentId: event.parent_id } : {}), ...(event.thread_id ? { threadId: event.thread_id } : {}) } }
+      ...(event.parent_id ? { parentId: event.parent_id } : {}), ...(event.thread_id ? { threadId: event.thread_id } : {}),
+      // The edit does not make new work; it is recorded so the panel can show the message changed.
+      ...(event.updated === true ? { edited: true, ...(editedAt ? { editedAt } : {}) } : {}) } }
 }
 export const feishuParent = (trigger: Trigger): string | undefined =>
   trigger.source === SOURCE && typeof trigger.meta.parentId === 'string' ? feishuTriggerId(trigger.meta.parentId) : undefined
@@ -50,11 +65,12 @@ export function feishuRef(trigger: Trigger): FeishuRef | undefined {
   return { triggerId: trigger.id, chatId: meta.chatId, messageId: meta.messageId, at: trigger.at }
 }
 
-/** A message from the history API; a deleted message may have no body/content. */
+/** A message from the history API; a deleted message may have no body/content, and an edited one states its update time. */
 export const HistoricalMessageSchema = z.looseObject({
   message_id: z.string(), chat_id: z.string(), create_time: z.string(),
   root_id: z.string().optional(), parent_id: z.string().optional(), thread_id: z.string().optional(),
   deleted: z.boolean().optional(), message_app_link: z.string().optional(),
+  update_time: z.string().optional(), updated: z.boolean().optional(),
   sender: z.looseObject({ id: z.string().default(''), sender_type: z.string() }),
   body: z.looseObject({ content: z.string() }).optional(),
   mentions: z.array(z.looseObject({ id: z.string(), key: z.string().optional(), name: z.string().optional() })).optional(),
@@ -75,7 +91,7 @@ export function historyEvent(message: HistoricalMessage, chatId: string, direct:
   return { message_id: message.message_id, chat_id: chatId, chat_type: direct ? 'p2p' : 'group', create_time: message.create_time,
     sender_id: message.sender.id, sender_type: message.sender.sender_type === 'user' ? 'user' : 'bot', content: historyText(message),
     mentions: message.mentions ?? [], root_id: message.root_id, parent_id: message.parent_id, thread_id: message.thread_id,
-    message_app_link: message.message_app_link }
+    message_app_link: message.message_app_link, update_time: message.update_time, updated: message.updated }
 }
 /**
  * Adapts a topic-page message into the live-event schema, falling back to `root` when Feishu omits `root_id` on replies;
@@ -85,5 +101,6 @@ export function topicEvent(message: FeishuMessage, chatId: string, direct: boole
   return { message_id: message.message_id, chat_id: chatId, chat_type: direct ? 'p2p' : 'group', create_time: message.create_time,
     sender_id: message.sender.open_bot_id ?? message.sender.id, sender_type: message.sender.sender_type === 'user' ? 'user' : 'bot',
     content: message.content ?? '', mentions: message.mentions ?? [], parent_id: message.parent_id, thread_id: message.thread_id,
-    root_id: message.root_id ?? (message.message_id === root ? undefined : root), message_app_link: message.message_app_link }
+    root_id: message.root_id ?? (message.message_id === root ? undefined : root), message_app_link: message.message_app_link,
+    update_time: message.update_time, updated: message.updated }
 }
