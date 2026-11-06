@@ -9,7 +9,7 @@ import { delimiter, join, resolve } from 'node:path'
 import type { SubprocessOutputReader, SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
 import type { Deployment } from '../deployment.ts'
 import { SetupError } from '../setup.ts'
-import { CliError } from './commands.ts'
+import { CliError, spawnInvocation } from './commands.ts'
 
 /** Windows starts a process only from an executable image, a `.cmd`, or a `.bat`, never from an extensionless file. */
 const WINDOWS = process.platform === 'win32'
@@ -170,17 +170,10 @@ export function applyEnvironment(variables: Record<string, string | undefined>, 
   return () => { apply(previous) }
 }
 
-/**
- * Windows starts a process only from an executable image, so a `.cmd` or `.bat` CLI would make CreateProcess fail. It is
- * run through `cmd.exe` instead, as a shell would run it. Node's own argument quoting escapes quotes with a backslash,
- * which cmd.exe does not read as an escape, so the command line travels as an environment variable that cmd expands once:
- * `call` keeps the leading quoted path from being stripped with `/s`.
- */
+/** {@link spawnInvocation} for the DSH subprocess runtime, which takes its own environment overrides. */
 function spawnSpec(argv: readonly string[], env: Record<string, string> | undefined): { argv: string[]; env: Record<string, string> | undefined } {
-  const program = argv[0]
-  if (!WINDOWS || program === undefined || !/\.(?:cmd|bat)$/i.test(program)) return { argv: [...argv], env }
-  const command = ['call', ...argv.map(argument => `"${argument.replaceAll('"', '""')}"`)].join(' ')
-  return { argv: [process.env.ComSpec ?? 'cmd.exe', '/d', '/s', '/c', '%DSH_SUPERAGENT_SPAWN%'], env: { ...env, DSH_SUPERAGENT_SPAWN: command } }
+  const invocation = spawnInvocation(argv)
+  return { argv: invocation.argv, env: 'DSH_SUPERAGENT_SPAWN' in invocation.env ? { ...env, ...invocation.env } : env }
 }
 
 /** Spawns a command through the DSH subprocess runtime, which strips credential-shaped environment variables. */

@@ -39,8 +39,21 @@ function ended(error: unknown): string {
   if (typeof code === 'number') return `exited with code ${code}`
   return typeof code === 'string' ? `could not run: ${code}` : 'failed'
 }
-export interface Tally { skipped: number }
-/** Parses array elements against a schema, skipping invalid items and incrementing `tally.skipped`. */
+const WINDOWS = process.platform === 'win32'
+/** Whether `program` names a batch file, which Windows cannot start as a process image. */
+export const isBatchProgram = (program: string | undefined): boolean => WINDOWS && program !== undefined && /\.(?:cmd|bat)$/i.test(program)
+/**
+ * The argv and environment that run a CLI: a `.cmd` or `.bat` program runs through `cmd.exe`, because Windows starts a
+ * process only from an executable image. Node's own argument quoting escapes quotes with a backslash, which cmd.exe
+ * does not read as an escape, so the command line travels as an environment variable that cmd expands once:
+ * `call` keeps the leading quoted path from being stripped with `/s`.
+ */
+export function spawnInvocation(argv: readonly string[]): { argv: string[]; env: Record<string, string> } {
+  if (!isBatchProgram(argv[0])) return { argv: [...argv], env: {} }
+  const command = ['call', ...argv.map(argument => `"${argument.replaceAll('"', '""')}"`)].join(' ')
+  return { argv: [process.env.ComSpec ?? 'cmd.exe', '/d', '/s', '/c', '%DSH_SUPERAGENT_SPAWN%'], env: { DSH_SUPERAGENT_SPAWN: command } }
+}
+export interface Tally { skipped: number }/** Parses array elements against a schema, skipping invalid items and incrementing `tally.skipped`. */
 export function validItems<T>(item: z.ZodType<T>, list: readonly unknown[], tally?: Tally): T[] {
   const items = list.flatMap(value => { const parsed = item.safeParse(value); return parsed.success ? [parsed.data] : [] })
   if (tally) tally.skipped += list.length - items.length
@@ -66,9 +79,11 @@ export class Commands {
   get repository(): string { return this.deployment.repository }
   withSignal(signal?: AbortSignal): Commands { return signal ? new Commands(this.resolved, this.environment, AbortSignal.any([this.signal, signal])) : this }
   async run(program: string, args: string[], cwd?: string): Promise<string> {
+    // A deployment may name a `.cmd` wrapper as its CLI on Windows, which CreateProcess cannot start directly.
+    const invocation = spawnInvocation([program, ...args])
     try {
-      const { stdout } = await exec(program, args, { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
-        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' } })
+      const { stdout } = await exec(invocation.argv[0]!, invocation.argv.slice(1), { cwd, signal: this.signal, timeout: TIMEOUT_MS, maxBuffer: 16 * 1024 * 1024,
+        env: { ...process.env, ...this.environment, GH_PROMPT_DISABLED: '1', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1', ...invocation.env } })
       return stdout
     } catch (error) { throw commandError(error, program) }
   }

@@ -1,7 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
-import { basename } from 'node:path'
-import { CliError, Commands, commandError } from '../src/infra/commands.ts'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
+import { CliError, Commands, commandError, spawnInvocation } from '../src/infra/commands.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { feishuChannel } from '../src/sources/feishu-trigger.ts'
 import { githubKind } from '../src/sources/github.ts'
@@ -220,4 +222,24 @@ it('stops a running command when the signal of its work aborts, or the lifetime,
   lifetime.abort()
   await expect(other).rejects.toThrow()
   expect(Date.now() - started).toBeLessThan(4000)
+})
+
+describe('batch CLI wrappers', () => {
+  it('runs a .cmd or .bat program through cmd.exe on Windows, and leaves other programs alone', () => {
+    // Windows starts a process only from an executable image, so a deployment that names a `.cmd` wrapper as its CLI needs cmd.exe.
+    expect(spawnInvocation(['/path/agent-gh', 'api', 'user'])).toEqual({ argv: ['/path/agent-gh', 'api', 'user'], env: {} })
+    const invocation = spawnInvocation(['C:\\tools\\gh-agent.cmd', 'api', 'user'])
+    if (process.platform !== 'win32') return expect(invocation).toEqual({ argv: ['C:\\tools\\gh-agent.cmd', 'api', 'user'], env: {} })
+    expect(invocation.argv).toEqual([process.env.ComSpec ?? 'cmd.exe', '/d', '/s', '/c', '%DSH_SUPERAGENT_SPAWN%'])
+    expect(invocation.env.DSH_SUPERAGENT_SPAWN).toBe('call "C:\\tools\\gh-agent.cmd" "api" "user"')
+  })
+  it.runIf(process.platform === 'win32')('runs a .cmd CLI a deployment names, with its arguments, as a worker shell would', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'commands-cmd-'))
+    const file = join(directory, 'say-args.cmd')
+    writeFileSync(file, '@echo off\r\necho [%~1] [%~2]\r\n', 'utf8')
+    try {
+      const commands = new Commands(() => deployment, {}, new AbortController().signal)
+      expect((await commands.run(file, ['api', 'a b'])).trim()).toBe('[api] [a b]')
+    } finally { rmSync(directory, { recursive: true, force: true }) }
+  })
 })
