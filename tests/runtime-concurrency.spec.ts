@@ -9,7 +9,7 @@ import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transi
 import { SettingsSchema } from '../src/policy.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { deferred, waitUntil } from './fixtures/async.ts'
-import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
+import { CHAT, MEMBER, feishu, prepareShell, startRuntime, type Host } from './fixtures/host.ts'
 
 /** The `onCompromised` callback each Runtime registered on its state directory lock. */
 const lockWatchers = vi.hoisted(() => new Map<string, (error: Error) => void>())
@@ -101,7 +101,7 @@ it('runs prepare commands in the background, side by side, while accepts, intake
   h.runtime.store.saveSettings({ ...settings, executor: { ...settings.executor, prepare: 'git -C /srv/widgets worktree add "$DSH_SUPERAGENT_DIR"' } })
   const prepare = deferred()
   h.hooks.prepare = prepare.promise
-  const prepares = () => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === 'sh').length
+  const prepares = () => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === prepareShell[0]).length
   const first = [feishu('1', '@bot 修一'), feishu('2', '@bot 修二')]
   for (const trigger of first) h.runtime.receive(trigger)
   await h.runtime.idle()
@@ -128,7 +128,7 @@ it('keeps a launch that a pause cut short queued, and finishes it once processin
   const trigger = feishu('1', '@bot 修一')
   h.runtime.receive(trigger); await h.runtime.idle()
   await h.route({ kind: 'accept', trigger_id: trigger.id, title: 'fix', worktree_name: 'fix-one', acknowledgement: '收到。' })
-  await waitUntil(() => h.subprocess.spawn.mock.calls.some(([spec]) => spec.argv[0] === 'sh'))
+  await waitUntil(() => h.subprocess.spawn.mock.calls.some(([spec]) => spec.argv[0] === prepareShell[0]))
   await h.runtime.settings.pause(true, 'panel')
   prepare.resolve(); await h.runtime.idle()
   const [ticket] = h.runtime.store.tickets.list()
@@ -180,7 +180,7 @@ it('counts a launch under way against maxWorkers, so a bot\'s Input for an idle 
   h.hooks.prepare = prepare.promise
   h.runtime.receive(feishu('5', '@bot 修二')); await h.runtime.idle()
   await h.route({ kind: 'accept', trigger_id: feishu('5', '').id, title: 'two', worktree_name: 'fix-two', acknowledgement: '收到。' })
-  await waitUntil(() => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === 'sh').length === 2)
+  await waitUntil(() => h.subprocess.spawn.mock.calls.filter(([spec]) => spec.argv[0] === prepareShell[0]).length === 2)
   h.runtime.receive(botMessage()); await h.runtime.pump()
   expect(h.runtime.store.tickets.get(one.ticket.id)!.undelivered).toHaveLength(1)
   expect(h.agents.get(one.sessionId)!.status).toBe('idle')
