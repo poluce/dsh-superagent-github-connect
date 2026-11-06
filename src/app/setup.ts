@@ -1,21 +1,28 @@
 /** Probes repository and account CLIs, configures the worker execution environment and command shims, and tracks setup readiness. */
 import type { Context } from '@deepseek-ai/cordis'
 import { UserError } from '../core/index.ts'
-import { SETUP_FIELDS, resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
+import { resolveDeployment, resolveFeishuBot, workerProbe, type Deployment, type Machine } from '../deployment.ts'
 import { agentVariables, applyEnvironment, verifyEnvironment, withoutDirectory, workerBin, writeEnvironment } from '../infra/environment.ts'
 import type { Settings, SettingsBlock } from '../policy.ts'
 import { SetupError, type SetupProblem } from '../setup.ts'
+import type { SourceKind } from '../sources/kind.ts'
+
+/** The configuration fields setup reads, by Source id, as the Source kinds declare them (`SourceKind.setup.fields`). */
+export type SetupFields = Readonly<Record<string, readonly string[]>>
 
 export interface SetupHost {
   readonly context: Context
   readonly machine: Machine
   readonly lifetime: AbortSignal
   restart(): void
+  /** The installed kind `id` names, whose declared setup fields and account check decide what a save runs. */
+  sourceKind(id: string): SourceKind | undefined
 }
 
-const setupFields = (settings: Settings) =>
-  JSON.stringify(Object.entries(SETUP_FIELDS).map(([id, keys]) => keys.map(key => settings.sources[id]?.config[key] ?? '')))
-export const setupChanged = (before: Settings, after: Settings): boolean => setupFields(before) !== setupFields(after)
+/** The values of the fields setup reads, in a stable order, so a save that changes one restarts dsh-superagent. */
+const setupValues = (settings: Settings, fields: SetupFields) =>
+  JSON.stringify(Object.entries(fields).map(([id, keys]) => keys.map(key => settings.sources[id]?.config[key] ?? '')))
+export const setupChanged = (before: Settings, after: Settings, fields: SetupFields): boolean => setupValues(before, fields) !== setupValues(after, fields)
 
 /**
  * Resolves the target repository, GitHub account, and optional Feishu bot by probing CLIs, then writes and applies the isolated git and shim environment used by worker processes.
@@ -41,6 +48,10 @@ export class Setup {
     return this.resolved
   }
   configured(): boolean { return this.resolved !== undefined }
+  /** Setup problems recorded for this run: the required account's, and those of options such as the Feishu bot. */
+  problems(): SetupProblem[] {
+    return [this.problem, this.feishuProblem].filter((problem): problem is SetupProblem => problem !== undefined)
+  }
   /** Resolve deployment accounts and apply the worker environment, recording `SetupError` failures in `problem`/`feishuProblem` and rethrowing unexpected errors. */
   async run(settings: Settings): Promise<boolean> {
     try { this.resolved = await this.resolve(settings); return true }
@@ -57,12 +68,17 @@ export class Setup {
   }
   /** Defer the restart to the next macrotask so the current HTTP or tool caller receives its response first. */
   restart(): void { setTimeout(this.host.restart, 0) }
-  /** Verify account CLIs for a modified source block before saving, ignoring setup errors belonging to other blocks. */
+  /**
+   * Verify the account of a modified source block before saving, through the check its kind declares; errors that belong
+   * to another place are ignored, as a source's check may report a problem elsewhere than its own block.
+   */
   async checkAccounts(block: SettingsBlock, settings: Settings): Promise<void> {
     const { machine } = this.host
-    const check = block === 'source:feishu' ? resolveFeishuBot(machine, settings.sources.feishu?.config, this.probe())
-      : resolveDeployment(machine, settings.sources.github?.config, this.probe())
-    await check.catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === block.slice(7)) throw error })
+    const id = block.slice('source:'.length)
+    const check = this.host.sourceKind(id)?.setup?.check
+    if (!check) return
+    await check({ machine, config: settings.sources[id]?.config, probe: this.probe(), path: process.env.PATH ?? '' })
+      .catch((error: unknown) => { if (!(error instanceof SetupError) || error.place === id) throw error })
   }
   async blockCommands(blocked: readonly string[]): Promise<void> {
     if (this.resolved) await writeEnvironment(this.resolved, blocked)

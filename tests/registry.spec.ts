@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { z } from 'zod'
 import { SettingsSchema } from '../src/policy.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
@@ -8,15 +8,52 @@ import type { OutboundMessage } from '../src/core/index.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { HealthBoard } from '../src/infra/health.ts'
 import { sourceContextOf, type SourceContextDeps } from '../src/app/source-context.ts'
+import { SetupError } from '../src/setup.ts'
+import { resourceDescriptors, resourceGrammar, readResource, type ResourceHost } from '../src/app/resources.ts'
+import { problemOf, sourceHealth } from '../src/app/views/sources.ts'
+import { settingsView } from '../src/app/views/settings.ts'
+import { TextCache } from '../src/app/cache.ts'
+import { setupPage } from '../src/client/route.ts'
+import { defaultPrompts } from '../src/app/prompts.ts'
 import { feishuChannel, feishuTrigger, feishuTriggerId } from '../src/sources/feishu-trigger.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 import { feishuKind } from '../src/sources/feishu.ts'
 import { githubKind } from '../src/sources/github.ts'
+import { startRuntime } from './fixtures/host.ts'
 
 const probe: SourceKind<{ interval: number }> = {
   kind: 'probe', title: { zh: '探针', en: 'Probe' }, description: { zh: '', en: '' }, health: [],
   schema: z.object({ interval: z.number().int().min(1).default(5) }).strict(),
   fields: [{ key: 'interval', type: 'number', min: 1, max: 60, label: { zh: '间隔', en: 'Interval' } }],
+}
+/** The problems the webhook kind's account check reports, declared with the kind as a third-party plugin would. */
+const WEBHOOK_PROBLEMS = { webhookTokenMissing: ['webhook', 'The webhook Source names no token.'] } as const
+/**
+ * A third Source kind, written the way docs/008 describes a plugin: it declares its setup fields, its health words, its
+ * skill and its resource prefix on the kind alone, and no module of the generic layer names it.
+ */
+const webhookKind: SourceKind<{ token: string; pollSeconds: number }> = {
+  kind: 'webhook',
+  title: { zh: 'Webhook 队列', en: 'Webhook queue' },
+  description: { zh: '接收 webhook 队列里发给智能体的消息。', en: 'Receives messages sent to the agent from the webhook queue.' },
+  schema: z.object({ token: z.string().trim().default(''), pollSeconds: z.number().int().min(10).max(3600).default(30) }).strict(),
+  fields: [
+    { key: 'token', type: 'text', label: { zh: '访问令牌', en: 'Token' } },
+    { key: 'pollSeconds', type: 'number', min: 10, max: 3600, advanced: true, label: { zh: '轮询间隔 / 秒', en: 'Polling interval / seconds' } },
+  ],
+  health: ['webhook'],
+  healthCodes: { webhookDown: { zh: 'webhook 队列不可用', en: 'The webhook queue is unreachable' } },
+  setup: {
+    fields: ['token'],
+    problems: WEBHOOK_PROBLEMS,
+    check: async ({ config }) => {
+      if (!(config as { token?: string }).token) throw new SetupError('webhookTokenMissing', {}, WEBHOOK_PROBLEMS)
+    },
+  },
+  skill: { name: 'webhook', text: 'Read queue messages with orchestrator_read webhook/<message-id>.',
+    description: 'Read webhook queue messages.' },
+  resources: { name: 'webhook/<message-id>/…', holds: 'a webhook original', executor: true,
+    read: async ({ resource, rest }) => ({ resource, rest }) },
 }
 
 describe('Source registry', () => {
@@ -158,5 +195,79 @@ describe('Source registry', () => {
     const reply: OutboundMessage = { id: 'reply-1', channel, text: 'Done', kind: 'reply' }
     expect(await sources.send(reply, commands)).toBe('sent')
     expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['+messages-reply', '--message-id', 'om_dm']))
+  })
+})
+
+describe('Source protocol extensions', () => {
+  let host: Awaited<ReturnType<typeof startRuntime>> | undefined
+  afterEach(async () => { await host?.stop(); host = undefined })
+
+  it('gives a third kind its own health words, setup problem and fix place, with no generic module naming it', () => {
+    const board = new HealthBoard()
+    const sources = new SourceRegistry(() => SettingsSchema.parse({}), board)
+    sources.register(webhookKind)
+    const ctx = sourceContextOf({ sources } as unknown as SourceContextDeps, webhookKind)
+    const down = ctx.healthOf('error', 'webhookDown')
+    expect(down).toEqual({ state: 'error', detail: 'The webhook queue is unreachable', code: 'webhookDown',
+      text: { zh: 'webhook 队列不可用', en: 'The webhook queue is unreachable' } })
+    ctx.report('webhook', down)
+    // The panel receives the kind's words with the entry; a protocol code keeps the key it localizes by.
+    expect(sourceHealth(sources, sources.instance('webhook')!, board.all).health).toEqual([{ name: 'webhook', ...down }])
+    expect(ctx.healthOf('paused', 'setupPending')).toEqual({ state: 'paused', detail: 'Waiting for the deployment check', code: 'setupPending' })
+    // The declared problem names where it is fixed, and the panel opens that Source's settings page for it.
+    const problem = new SetupError('webhookTokenMissing', {}, WEBHOOK_PROBLEMS).problem
+    expect(problem).toMatchObject({ place: 'webhook', code: 'webhookTokenMissing', detail: 'The webhook Source names no token.' })
+    expect(problemOf('webhook', { problems: [problem] })).toBe(problem)
+    expect(setupPage(problem.place)).toEqual({ page: 'settings', query: { group: 'source', source: 'webhook' } })
+  })
+
+  it('lets a third kind declare the setup fields only the panel may change, whose save checks its account', async () => {
+    host = await startRuntime()
+    const { runtime } = host
+    const unregister = runtime.sources.register(webhookKind)
+    try {
+      // The fields setup reads come from the kinds alone; the two built-in ones exhibit their old lists.
+      expect(runtime.sources.setupFields()).toEqual({ feishu: ['cli'], github: ['repository', 'cli'], webhook: ['token'] })
+      const seeded = runtime.store.settings()
+      runtime.store.saveSettings({ ...seeded, sources: { ...seeded.sources, webhook: { enabled: true, config: { token: 'seed' } } } })
+      const view = settingsView(runtime.store, runtime.sources, runtime.health, { deployment: runtime.deployment }, runtime.machine.stateDir)
+      expect(view.sources.find(source => source.id === 'webhook')).toMatchObject({ restarts: ['token'], fields: [
+        expect.objectContaining({ key: 'token' }), expect.objectContaining({ key: 'pollSeconds' })] })
+      const save = (value: Record<string, unknown>, origin: 'panel' | 'tool') => runtime.settings.save('source:webhook',
+        { enabled: true, config: { ...runtime.store.settings().sources.webhook!.config, ...value } },
+        runtime.store.blockRevision('source:webhook'), origin)
+      // A field setup reads is panel-only for a kind that is not built in, and a panel save runs the kind's check.
+      await expect(save({ token: '' }, 'tool')).rejects.toThrow('can only be changed in the management panel')
+      await expect(save({ token: '' }, 'panel')).rejects.toMatchObject({ code: 'webhookTokenMissing' })
+      // Its other fields take effect without a restart, from any origin.
+      expect(await save({ pollSeconds: 90 }, 'tool')).toMatchObject({ saved: true, restarting: false })
+      expect(runtime.store.settings().sources.webhook!.config).toMatchObject({ token: 'seed', pollSeconds: 90 })
+      expect(await save({ token: 'next' }, 'panel')).toMatchObject({ saved: true, restarting: true })
+    } finally { unregister() }
+  })
+
+  it('registers a third kind\'s skill, prompt part and original-record resources through the registry alone', async () => {
+    host = await startRuntime()
+    const { runtime } = host
+    const unregister = runtime.sources.register(webhookKind)
+    try {
+      const config = runtime.prompts.current().config
+      expect(runtime.prompts.skillDetails(config)).toContainEqual({ name: 'webhook',
+        content: 'Read queue messages with orchestrator_read webhook/<message-id>.', description: 'Read webhook queue messages.' })
+      expect(runtime.prompts.skills(config).map(([name]) => name)).toEqual(['feishu', 'github', 'webhook'])
+      expect(runtime.prompts.parts()['skill/webhook']?.text).toBe('Read queue messages with orchestrator_read webhook/<message-id>.')
+      // A team skill may not take a name a kind declares as built in.
+      expect(() => runtime.prompts.validate({ ...defaultPrompts(), skills: { webhook: 'mine' } })).toThrow('built-in skill')
+      // The kind's originals are listed for the model and read through the same generic route as the built-in ones.
+      expect(resourceDescriptors().map(resource => resource.name)).toContain('webhook/<message-id>/…')
+      expect(resourceGrammar(false)).toContain('webhook/<message-id>/…: a webhook original')
+      const readHost = { store: runtime.store, pages: new TextCache(4096), prompts: runtime.prompts, commands: runtime.commands,
+        sources: runtime.sources, masterId: runtime.masterId, context: host.ctx, promptVersion: () => runtime.prompts.current(),
+        mayRead: () => true, sourceLink: async () => ({}) } as unknown as ResourceHost
+      const page = await readResource(readHost, 'webhook/m1/message', 0, undefined) as { text: string; next_offset: number | null }
+      expect(JSON.parse(page.text)).toEqual({ resource: 'webhook/m1/message', rest: 'm1/message' })
+      // Offset 0 is cached, so reading further into the record does not call the CLI again.
+      expect(await readResource(readHost, 'webhook/m1/message', 1, undefined)).toBeDefined()
+    } finally { unregister() }
   })
 })

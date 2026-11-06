@@ -31,9 +31,11 @@ function label(t: T, reason: Reason): string {
   if (/^\w*Error\b/.test(written)) { const first = written.split('\n')[0]!; return first.length > 140 ? `${first.slice(0, 140)}…` : first }
   return written
 }
-export const setupText = (t: T, problem: Pick<SetupProblem, 'code' | 'values'>): string => t(`setup.${problem.code}`, problem.values)
-export const healthText = (t: T, health: Pick<Health, 'detail' | 'code' | 'values'>): string =>
-  health.code ? t(`healthCode.${health.code}` as const, health.values) : health.detail
+// A Source kind declares its own words for the codes the panel has no localization for; the built-in ones keep theirs.
+export const setupText = (t: T, problem: Pick<SetupProblem, 'code' | 'values' | 'text'>): string =>
+  problem.text ? localized(t, problem.text) : t(`setup.${problem.code}` as DshSuperagentKey, problem.values)
+export const healthText = (t: T, health: Pick<Health, 'detail' | 'code' | 'values' | 'text'>): string =>
+  health.text ? localized(t, health.text) : health.code ? t(`healthCode.${health.code}` as DshSuperagentKey, health.values) : health.detail
 /** Replaces Feishu and GitHub content placeholders (images, cards, media, forwards, unresolved mentions) with localized labels. */
 export function readableMarkers(t: T, text: string): string {
   return text.replace(/!\[[^\]]*\]\([^)]*\)|\[Image: [^\]]*\]|\[image\]/g, t('imageMarker'))

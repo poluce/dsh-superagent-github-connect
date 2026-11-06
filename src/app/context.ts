@@ -1,5 +1,5 @@
 /** Built-in prompt sections, role policies, and transcript projections for orchestrator and worker Sessions. */
-import { bundledSkills, promptFile } from './skill-files.ts'
+import { promptFile } from './skill-files.ts'
 import type { SessionEvent } from '@deepseek-ai/dsh-session'
 export { textPage } from './cards.ts'
 
@@ -10,8 +10,7 @@ export const workerPrompt = promptFile('worker')
 /** Built-in policy sections referenced by role prompts; a team may override them. */
 export const guides: Readonly<Record<string, string>> = Object.fromEntries(['subscriptions', 'replies', 'dispatch', 'work']
   .map(name => [name, promptFile(name)]))
-/** Bundled Source skills registered by dsh-superagent; a team may override their text. */
-export const sourceSkills: Readonly<Record<'feishu' | 'github', string>> = { feishu: bundledSkills.feishu.content, github: bundledSkills.github.content }
+/** The CLI notes a packaged Source skill appends to its text. */
 export const cliNotes = promptFile('cli')
 /** Default text for the team-editable prompt sections (communication, ticket scope, and PR delivery). */
 export const teamDefaults = {

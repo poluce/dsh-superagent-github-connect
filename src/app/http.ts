@@ -4,9 +4,9 @@ import type {} from '@deepseek-ai/dsh-host-webserver'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { z } from 'zod'
 import { THREAD_FILTERS, TICKET_FILTERS, type Api, type ApiResponse, type RouteParams } from './api.ts'
-import { sourceSkills } from './context.ts'
+import { bundledSkills } from './skill-files.ts'
 import type { ModelCatalog } from '@deepseek-ai/dsh-api-session-controller/types'
-import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, builtInParts, defaultPrompts, savePrompts, type Prompts }
+import { PromptConflict, SKILL_NAME, SKILL_PREFIX, TEAM_SECTIONS, builtInBase, defaultPrompts, savePrompts, type Prompts }
   from './prompts.ts'
 import { policyVersion } from '../policy.ts'
 import { SettingsConflict, type Settings } from './settings.ts'
@@ -33,7 +33,7 @@ export interface HttpHost {
   /** Feishu message links resolved since startup, used by search to match AppLink URLs. */
   readonly sourceLinks: Pick<TextCache, 'entries'>
   readonly sources: SourceRegistry
-  readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged'>
+  readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'preview' | 'save' | 'defaultChanged' | 'parts'>
   readonly sessions: Pick<Sessions, 'status' | 'notify' | 'delivery'>
   readonly settings: Pick<Settings, 'view' | 'save' | 'pause' | 'sync' | 'refreshLabels'>
   readonly engine: EngineForPeople
@@ -124,9 +124,11 @@ function promptsView(runtime: HttpHost, revision: number | undefined, offset: nu
   const shown = revision === undefined || revision === current.revision ? current : runtime.prompts.version(revision)
   // Each built-in part with the key of its text, which an override records as its base, and for the overrides shown whose
   // built-in text changed since, the text they were edited from when known.
-  const parts = Object.entries(builtInParts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) }))
+  const parts = Object.entries(runtime.prompts.parts()).map(([key, part]) => ({ key, ...part, base: builtInBase(part.text) }))
+  // The names a team skill may not take: the packaged skills and every skill an installed kind declares.
+  const builtin = [...new Set([...Object.keys(bundledSkills), ...runtime.sources.skillNames()])]
   return { masterId: runtime.masterId, current: shown, defaults: defaultPrompts(), sections: TEAM_SECTIONS, skillName: SKILL_NAME.source,
-    builtin: Object.keys(sourceSkills), skillPrefix: SKILL_PREFIX, parts, defaultChanged: runtime.prompts.defaultChanged(shown.config),
+    builtin, skillPrefix: SKILL_PREFIX, parts, defaultChanged: runtime.prompts.defaultChanged(shown.config),
     ...runtime.sessions.status(), ...runtime.prompts.history(offset) }
 }
 export type PromptsView = ReturnType<typeof promptsView>

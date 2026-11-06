@@ -3,7 +3,9 @@ import type { ChannelRef, OutboundMessage, ScopeResult, SourceScope, Trigger } f
 import type { Commands } from '../infra/commands.ts'
 import { HealthBoard, type HealthEntry } from '../infra/health.ts'
 import { AdmissionTableSchema, type Settings } from '../policy.ts'
-import type { ChannelLink, ChannelLinks, SourceInstance, SourceKind, TriggerContext, VariableSpec } from './kind.ts'
+import type { Deployment } from '../deployment.ts'
+import type { Localized } from './kind.ts'
+import type { ChannelLink, ChannelLinks, SourceInstance, SourceKind, SourceResources, SourceSkill, TriggerContext, VariableSpec } from './kind.ts'
 
 
 /**
@@ -77,6 +79,39 @@ export class SourceRegistry implements SourceScope {
     if (!kind) return false
     const instance = this.resolve(kind, settings.sources[channel.source])
     return instance.enabled && (kind.channel?.allowed?.(channel.address, instance.config) ?? true)
+  }
+  /**
+   * Configuration fields deployment setup reads, by Source id, as each kind declares them (`kind.setup.fields`); a change
+   * restarts dsh-superagent after the kind's account check, and only the management panel may make it.
+   */
+  setupFields(): Record<string, readonly string[]> {
+    return Object.fromEntries([...this.kinds.values()].sort((a, b) => a.kind.localeCompare(b.kind)).flatMap(kind => {
+      const fields = kind.setup?.fields ?? []
+      return fields.length ? [[kind.kind, fields] as const] : []
+    }))
+  }
+  /** The words a kind declares for a health code, if a kind declares one: the panel words that entry by them. */
+  healthText(code: string): Localized | undefined {
+    for (const kind of this.kinds.values()) {
+      const text = kind.healthCodes?.[code]
+      if (text) return text
+    }
+    return undefined
+  }
+  /** Built-in skills of the installed kinds, leaving out those the deployment does not support yet (`when`), in id order. */
+  skills(deployment: Deployment | undefined): (SourceSkill & { kind: string })[] {
+    return [...this.kinds.values()].sort((a, b) => a.kind.localeCompare(b.kind))
+      .flatMap(kind => kind.skill && (kind.skill.when?.(deployment) ?? true) ? [{ kind: kind.kind, ...kind.skill }] : [])
+  }
+  /** Names of every skill the installed kinds declare, whether it registers now or not; the panel lists them as built in. */
+  skillNames(): string[] { return [...new Set([...this.kinds.values()].flatMap(kind => kind.skill ? [kind.skill.name] : []))] }
+  /** Original-record resources of the installed kinds, in id order; their prefix is the first segment of `name`. */
+  resources(): (SourceResources & { kind: string })[] {
+    return [...this.kinds.values()].sort((a, b) => a.kind.localeCompare(b.kind)).flatMap(kind => kind.resources ? [{ kind: kind.kind, ...kind.resources }] : [])
+  }
+  /** The kind that reads `resource` under its prefix, if a kind declares one. */
+  resourceOf(resource: string): (SourceResources & { kind: string }) | undefined {
+    return this.resources().find(item => resource.startsWith(`${item.name.split('/')[0]}/`))
   }
   /** Environment variable declarations for every installed kind, whether enabled or disabled. */
   declarations(): { kind: string; variables: readonly VariableSpec[] }[] {

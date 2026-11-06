@@ -2,9 +2,10 @@
 import type { Context } from '@deepseek-ai/cordis'
 import { key, type Thread } from '../core/index.ts'
 import { sameName } from '../infra/text.ts'
-import { GithubAccountsSchema } from '../deployment.ts'
+import { GithubAccountsSchema, resolveDeployment } from '../deployment.ts'
+import { GITHUB_SETUP_PROBLEMS } from './setup-problems.ts'
 import { CliError, validItems, type Tally } from '../infra/commands.ts'
-import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks } from './github-read.ts'
+import { ciCounts, ciFact, ciFailures, ciSummary, githubThreadContext, pullChecks, readGithub } from './github-read.ts'
 import { branchCiTrigger, ciTrigger, commentTrigger, CommentSchema, githubAddress, issueTrigger, IssueSchema, pullTrigger, SOURCE }
   from './github-trigger.ts'
 import { githubLink, sendGithub } from './github-channel.ts'
@@ -61,6 +62,17 @@ export const githubKind: SourceKind<GithubConfig> = {
     return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {} }
   },
   health: ['github'],
+  // The account CLI and repository are deployment setup: only the panel may change them, and a save checks the account.
+  setup: {
+    fields: Object.keys(GithubAccountsSchema.shape),
+    problems: GITHUB_SETUP_PROBLEMS,
+    check: ({ machine, config, probe, path }) => resolveDeployment(machine, config, probe, path),
+  },
+  // The built-in skill packs the read paths and the CLI notes workers use.
+  skill: { name: 'github', file: 'github', cli: true },
+  // Agents read repository originals under `github/…`.
+  resources: { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true,
+    read: ({ commands, resource }) => readGithub(commands, resource) },
   channel: { send: sendGithub, link: githubLink },
   threadContext: githubThreadContext,
   // `#12`, `12`, or the page of an Issue or PR, of any repository, names Thread 12.
