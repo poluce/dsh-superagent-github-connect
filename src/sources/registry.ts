@@ -124,13 +124,14 @@ export class SourceRegistry implements SourceScope {
     })
   }
   /**
-   * Sends a message idempotently through its Channel's kind; returns `'waiting'` while the kind is not installed, or
-   * `'gone'` when the target (or a kind without channels) can never receive it.
+   * Sends a message through its Channel's kind, telling the Channel which attempt this is by `idempotencyKey` (the
+   * Outbox passes the message's own id) so a retry after a crash cannot post it twice; returns `'waiting'` while the
+   * kind is not installed, or `'gone'` when the target (or a kind without channels) can never receive it.
    */
-  async send(message: OutboundMessage, commands: Commands): Promise<'sent' | 'gone' | 'waiting'> {
+  async send(message: OutboundMessage, commands: Commands, idempotencyKey = message.id): Promise<'sent' | 'gone' | 'waiting'> {
     const kind = this.kinds.get(message.channel.source)
     if (!kind) return 'waiting'
-    return kind.channel ? kind.channel.send({ commands }, message) : 'gone'
+    return kind.channel ? kind.channel.send({ commands }, message, idempotencyKey) : 'gone'
   }
   link(channel: ChannelRef, links: ChannelLinks): ChannelLink {
     const link = this.kinds.get(channel.source)?.channel?.link(channel.address, links)
