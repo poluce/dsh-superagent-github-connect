@@ -280,7 +280,13 @@ it('lists in the same order in SQLite and in memory, and undoes a failed nested 
 it('creates the state directory for its owner alone, and the database readable by its owner alone', () => {
   const path = join(directory, 'state', 'orchestrator.sqlite')
   new Store(path).close()
-  expect([statSync(dirname(path)).mode & 0o777, statSync(path).mode & 0o777]).toEqual([0o700, 0o600])
+  if (process.platform === 'win32') {
+    // Windows modes are a read-only flag, not permissions: who may open the files is decided by the ACL the directory
+    // inherits from the operator's profile. Assert the private POSIX modes only where they mean something.
+    expect([statSync(dirname(path)).isDirectory(), statSync(path).isFile()]).toEqual([true, true])
+  } else {
+    expect([statSync(dirname(path)).mode & 0o777, statSync(path).mode & 0o777]).toEqual([0o700, 0o600])
+  }
 })
 
 it('reads `%` and `_` in a key prefix and a search query as written, not as patterns', () => {

@@ -58,9 +58,11 @@ it('assembles every role from fixed sections around the team sections, whatever 
 })
 
 it('reads a prompt file whatever its line ends and blank lines, and names a missing or empty one', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'prompt-file-'))
-  // promptFile resolves paths relative to prompts/; use a relative path to reach the temp dir.
-  const name = (file: string) => relative(packagePath('prompts'), join(dir, file))
+  // promptFile resolves a name under the packaged prompts/ directory, so the temporary files have to live there: Windows has
+  // no relative path between two drives, and a temp directory on another drive cannot be named relative to prompts/.
+  const root = packagePath('prompts')
+  const dir = mkdtempSync(join(root, '.test-prompt-file-'))
+  const name = (file: string) => relative(root, join(dir, file))
   try {
     writeFileSync(join(dir, 'crlf.md'), 'One.\r\nTwo. \r\n \t\r\n\r\nThree.\r\n')
     writeFileSync(join(dir, 'blank.md'), ' \n\t\n')

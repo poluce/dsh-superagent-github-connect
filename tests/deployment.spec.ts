@@ -1,36 +1,58 @@
 import { execFile } from 'node:child_process'
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { promisify } from 'node:util'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Config, executable, machineOf, resolveDeployment, resolveFeishuBot, type Machine, type Probe } from '../src/deployment.ts'
 import { gitEnv } from './fixtures/git.ts'
 
 const exec = promisify(execFile)
+/** Windows resolves a command name through PATHEXT and runs a `.cmd` script only through cmd.exe. */
+const WINDOWS = process.platform === 'win32'
 let dir: string
 let path: string
-const program = (file: string, body = ''): string => { writeFileSync(file, `#!/bin/sh\n${body}\n`); chmodSync(file, 0o755); return file }
+/** Writes a stand-in CLI: a shell script on POSIX, a `.cmd` script on Windows. */
+const program = (file: string, posixBody = '', windowsBody = posixBody): string => {
+  if (!WINDOWS) { writeFileSync(file, `#!/bin/sh\n${posixBody}\n`); chmodSync(file, 0o755); return file }
+  writeFileSync(file, `@echo off\r\n${windowsBody.replaceAll('\n', '\r\n')}\r\n`)
+  return file
+}
+/** The path a command name resolves to here: a `.cmd` file on Windows. */
+const programPath = (file: string): string => WINDOWS ? `${file}.cmd` : file
 /** Fake gh CLI signed in as `login` with configurable push access to acme/widgets (including its former name acme/gadgets). */
-const gh = (file: string, login: string, push = true): string => program(file, `case "$*" in\n  "api user") echo '{"login":"${login}","id":7}' ;;\n  "api repos/acme/"*" --jq {name: .full_name, push: .permissions.push}") echo '{"name":"acme/widgets","push":${push}}' ;;\n  *) exit 1 ;;\nesac`)
+const gh = (file: string, login: string, push = true): string => program(file,
+  `case "$*" in\n  "api user") echo '{"login":"${login}","id":7}' ;;\n  "api repos/acme/"*" --jq {name: .full_name, push: .permissions.push}") echo '{"name":"acme/widgets","push":${push}}' ;;\n  *) exit 1 ;;\nesac`,
+  `if /i "%~1"=="api" if /i "%~2"=="user" (\n  echo {"login":"${login}","id":7}\n  exit /b 0\n)\nif /i "%~1"=="api" (\n  echo {"name":"acme/widgets","push":${push}}\n  exit /b 0\n)\nexit /b 1`)
 /** Fake lark-cli script body returning canned auth, strict-mode, and bot info responses. */
-const lark = (status: object, mode = 'bot', bot: object = { bot: { open_id: 'ou_bot', app_name: 'Widgets Bot' }, code: 0 }): string =>
-  `case "$*" in\n  "auth status") echo '${JSON.stringify(status)}' ;;\n  "config strict-mode") echo 'strict-mode: ${mode} (source: profile)' ;;\n  "api GET /open-apis/bot/v3/info --as bot --format ndjson") echo '${JSON.stringify(bot)}' ;;\nesac`
+const lark = (file: string, status: object, mode = 'bot', bot: object = { bot: { open_id: 'ou_bot', app_name: 'Widgets Bot' }, code: 0 }): string => program(file,
+  `case "$*" in\n  "auth status") echo '${JSON.stringify(status)}' ;;\n  "config strict-mode") echo 'strict-mode: ${mode} (source: profile)' ;;\n  "api GET /open-apis/bot/v3/info --as bot --format ndjson") echo '${JSON.stringify(bot)}' ;;\nesac`,
+  // A `)` inside the parenthesized block would close it early, so the Windows answer leaves the parentheses out.
+  `if /i "%~1"=="auth" if /i "%~2"=="status" (\n  echo ${JSON.stringify(status)}\n  exit /b 0\n)\nif /i "%~1"=="config" if /i "%~2"=="strict-mode" (\n  echo strict-mode: ${mode} source: profile\n  exit /b 0\n)\nif /i "%~1"=="api" (\n  echo ${JSON.stringify(bot)}\n  exit /b 0\n)\nexit /b 0`)
 const minimal = (overrides: Record<string, unknown> = {}) => ({ stateDir: join(dir, 'state'), ...overrides })
 const machine = (overrides: Partial<Machine> = {}): Machine => ({ ...machineOf(Config(minimal())), ...overrides })
-/** Runs commands like worker shells do, but locally: the stand-ins first on PATH, then the system's git. */
-const probe: Probe = async argv => (await exec(argv[0]!, argv.slice(1), { env: { PATH: path, HOME: dir } })).stdout
+/**
+ * Runs commands like worker shells do, but locally: the stand-ins first on PATH, then the system's git. A Windows `.cmd`
+ * stand-in cannot be started by CreateProcess, so it runs through cmd.exe as a worker shell runs it.
+ */
+const probe: Probe = async (argv, extra) => {
+  const env = { ...(WINDOWS ? process.env : {}), HOME: dir, PATH: path, ...extra }
+  if (WINDOWS) return (await exec(process.env.ComSpec ?? 'cmd.exe', ['/d', '/s', '/c', 'call', ...argv], { env })).stdout
+  return (await exec(argv[0]!, argv.slice(1), { env })).stdout
+}
 const setupError = (place: string, code: string, values: Record<string, unknown> = {}) => expect.objectContaining({ place, code, values: expect.objectContaining(values) })
 
 beforeEach(async () => {
   dir = mkdtempSync(join(tmpdir(), 'deployment-'))
   mkdirSync(join(dir, 'bin')); mkdirSync(join(dir, 'state', 'worker-bin'), { recursive: true }); mkdirSync(join(dir, 'widgets', 'src'), { recursive: true })
-  path = [join(dir, 'state-link', 'worker-bin'), `${join(dir, 'state', 'worker-bin')}/`, join(dir, 'bin'), '/usr/bin', '/bin'].join(':')
-  gh(join(dir, 'bin', 'gh'), 'Agent-Bot')
-  program(join(dir, 'bin', 'lark-cli'), lark({ appId: 'cli_bot', brand: 'lark', identities: { bot: { status: 'ready' } } }))
-  // Stale worker shims with the same binary name must be skipped regardless of PATH normalization or symlinks.
-  program(join(dir, 'state', 'worker-bin', 'gh'))
-  symlinkSync(join(dir, 'state'), join(dir, 'state-link'))
+  path = [join(dir, 'state-link', 'worker-bin'), `${join(dir, 'state', 'worker-bin')}/`, join(dir, 'bin'),
+    WINDOWS ? join(process.env.SystemRoot ?? 'C:\\Windows', 'system32') : '/usr/bin', WINDOWS ? process.env.SystemRoot ?? 'C:\\Windows' : '/bin'].join(delimiter)
+  gh(programPath(join(dir, 'bin', 'gh')), 'Agent-Bot')
+  lark(programPath(join(dir, 'bin', 'lark-cli')), { appId: 'cli_bot', brand: 'lark', identities: { bot: { status: 'ready' } } })
+  // Stale worker shims with the same binary name must be skipped regardless of PATH normalization or directory links.
+  program(programPath(join(dir, 'state', 'worker-bin', 'gh')))
+  // A junction links directories on Windows without the privilege a symbolic link needs.
+  symlinkSync(join(dir, 'state'), join(dir, 'state-link'), WINDOWS ? 'junction' : 'dir')
   await exec('git', ['init', '-q', join(dir, 'widgets')], { env: gitEnv() })
   await exec('git', ['-C', join(dir, 'widgets'), 'remote', 'add', 'origin', 'git@github.com:acme/widgets.git'], { env: gitEnv() })
 })
@@ -59,8 +81,8 @@ describe('configuration schema', () => {
 describe('setup', () => {
   it('reads the repository from the GitHub Source and the accounts from their CLIs, skipping the worker shims', async () => {
     const deployment = await resolveDeployment(machine(), { repository: 'acme/widgets', cli: 'gh' }, probe, path)
-    expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
-    expect(deployment.github).toEqual({ cli: join(dir, 'bin', 'gh'), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
+    expect(deployment).toMatchObject({ repository: 'acme/widgets', github: { cli: programPath(join(dir, 'bin', 'gh')), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' } })
+    expect(deployment.github).toEqual({ cli: programPath(join(dir, 'bin', 'gh')), login: 'Agent-Bot', noreply: '7+Agent-Bot@users.noreply.github.com' })
     expect(deployment).not.toHaveProperty('feishu')
     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
     expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
@@ -73,29 +95,30 @@ describe('setup', () => {
     await needs('github', 'agentCliUnset', {}, { repository })
     await needs('github', 'agentCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }, { repository, cli: join(dir, 'missing') })
     await needs('github', 'agentCliMissing', { output: 'bin/gh must be a command name or an absolute path' }, { repository, cli: 'bin/gh' })
-    await needs('github', 'agentCliSignedOut', {}, { repository, cli: program(join(dir, 'bin', 'gh-broken'), 'exit 1') })
-    await needs('github', 'repositoryReadOnly', { account: 'Agent-Bot', repository: 'acme/widgets' }, { repository, cli: gh(join(dir, 'bin', 'gh-reader'), 'Agent-Bot', false) })
+    await needs('github', 'agentCliSignedOut', {}, { repository, cli: program(programPath(join(dir, 'bin', 'gh-broken')), 'exit 1', 'exit /b 1') })
+    await needs('github', 'repositoryReadOnly', { account: 'Agent-Bot', repository: 'acme/widgets' }, { repository, cli: gh(programPath(join(dir, 'bin', 'gh-reader')), 'Agent-Bot', false) })
     // Signed in, but the account cannot read the repository, or the CLI names no account.
-    const unreadable = program(join(dir, 'bin', 'gh-outsider'),
-      `case "$*" in\n  "api user") echo '{"login":"Agent-Bot","id":7}' ;;\n  *) echo 'HTTP 404' >&2; exit 1 ;;\nesac`)
+    const unreadable = program(programPath(join(dir, 'bin', 'gh-outsider')),
+      `case "$*" in\n  "api user") echo '{"login":"Agent-Bot","id":7}' ;;\n  *) echo 'HTTP 404' >&2; exit 1 ;;\nesac`,
+      `if /i "%~1"=="api" if /i "%~2"=="user" (\n  echo {"login":"Agent-Bot","id":7}\n  exit /b 0\n)\n1>&2 echo HTTP 404\nexit /b 1`)
     const output = expect.stringContaining('HTTP 404') as unknown
     await needs('github', 'repositoryUnreadable', { account: 'Agent-Bot', repository: 'acme/widgets', output }, { repository, cli: unreadable })
-    await needs('github', 'agentCliNoAccount', {}, { repository, cli: program(join(dir, 'bin', 'gh-anonymous'), `echo '{}'`) })
+    await needs('github', 'agentCliNoAccount', {}, { repository, cli: program(programPath(join(dir, 'bin', 'gh-anonymous')), `echo '{}'`) })
     expect(() => executable('nothing-here', join(dir, 'bin'))).toThrow('nothing-here is not an executable file on PATH')
   })
   it('reads the Feishu bot from a bot-only lark-cli, or finds none when the Feishu Source names no CLI', async () => {
     expect(await resolveFeishuBot(machine(), {}, probe, path)).toBeUndefined()
-    expect(await resolveFeishuBot(machine(), { cli: 'lark-cli' }, probe, path)).toEqual({ cli: join(dir, 'bin', 'lark-cli'), appId: 'cli_bot', brand: 'lark', botId: 'ou_bot', name: 'Widgets Bot' })
+    expect(await resolveFeishuBot(machine(), { cli: 'lark-cli' }, probe, path)).toEqual({ cli: programPath(join(dir, 'bin', 'lark-cli')), appId: 'cli_bot', brand: 'lark', botId: 'ou_bot', name: 'Widgets Bot' })
     const refuses = async (code: string, values: Record<string, unknown> = {}) => expect(resolveFeishuBot(machine(), { cli: 'lark-cli' }, probe, path)).rejects.toEqual(setupError('feishu', code, values))
-    program(join(dir, 'bin', 'lark-cli'), lark({ identities: { bot: { status: 'ready' } } }))
+    lark(programPath(join(dir, 'bin', 'lark-cli')), { identities: { bot: { status: 'ready' } } })
     await refuses('feishuNoApp')
-    program(join(dir, 'bin', 'lark-cli'), lark({ appId: 'cli_bot', identities: { bot: { status: 'missing' } } }))
+    lark(programPath(join(dir, 'bin', 'lark-cli')), { appId: 'cli_bot', identities: { bot: { status: 'missing' } } })
     await refuses('feishuBotNotReady', { app: 'cli_bot', status: 'missing' })
-    program(join(dir, 'bin', 'lark-cli'), lark({ appId: 'cli_bot', identities: { bot: { status: 'ready' } } }, 'off'))
+    lark(programPath(join(dir, 'bin', 'lark-cli')), { appId: 'cli_bot', identities: { bot: { status: 'ready' } } }, 'off')
     await refuses('feishuUserIdentity', { mode: 'off' })
-    program(join(dir, 'bin', 'lark-cli'), lark({ appId: 'cli_bot', identities: { bot: { status: 'ready' } } }, 'bot', { code: 0, data: {} }))
+    lark(programPath(join(dir, 'bin', 'lark-cli')), { appId: 'cli_bot', identities: { bot: { status: 'ready' } } }, 'bot', { code: 0, data: {} })
     await refuses('feishuNoBot')
-    program(join(dir, 'bin', 'lark-cli'), 'echo "not configured" >&2; exit 1')
+    program(programPath(join(dir, 'bin', 'lark-cli')), 'echo "not configured" >&2; exit 1', '1>&2 echo not configured\nexit /b 1')
     await refuses('feishuCliFailed', { output: expect.stringContaining('not configured') })
   })
 })

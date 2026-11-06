@@ -10,7 +10,9 @@ import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra
 import { SetupError } from './setup.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
-const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
+/** Absolute paths are POSIX ones, or on Windows a drive-qualified or UNC path; a rooted path is absolute on every platform. */
+const ABSOLUTE_PATH = process.platform === 'win32' ? /^(?:\/|[A-Za-z]:[\\/]|\\\\)/ : /^\//
+const absolute = (description: string) => s.string().pattern(ABSOLUTE_PATH).description(`${description} Absolute path.`)
 /** Plugin configuration of the dsh-superagent entry. Volatile fields apply without a restart because dsh-superagent reads them on each use; changing `stateDir` remounts the plugin. */
 export const Config = s.object({
   stateDir: absolute('Directory for the database, locks, worker shims, the agent\'s git configuration and, by default, the ticket directories.').required(),
@@ -57,22 +59,44 @@ export interface Deployment extends Machine {
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
 
-/** Resolve a command name or absolute path to an executable file, ignoring the worker shim directory. */
+/** Path separators of the running platform: Windows accepts both. */
+const SEPARATORS = process.platform === 'win32' ? /[\\/]/ : /\//
+/** The extensions Windows searches for a bare command name, in PATHEXT's order. */
+function windowsExtensions(): string[] {
+  return (process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD').split(';').map(extension => extension.trim().toLowerCase()).filter(extension => extension.startsWith('.'))
+}
+/**
+ * Resolve a command name or absolute path to an executable file, ignoring the worker shim directory.
+ * Windows resolves a bare name only through PATHEXT, as `cmd` does, and then falls back to the exact name: a file renamed
+ * without an extension is a reminder of a POSIX installation, reported by the startup probe rather than as a missing CLI.
+ */
 export function executable(name: string, path: string, exclude?: string): string {
-  if (name.includes('/') && !isAbsolute(name)) throw new Error(`${name} must be a command name or an absolute path`)
-  const candidates = isAbsolute(name) ? [name] : path.split(delimiter).filter(dir => isAbsolute(dir) && !(exclude && sameDirectory(dir, exclude))).map(dir => join(dir, name))
+  const windows = process.platform === 'win32'
+  if (SEPARATORS.test(name) && !isAbsolute(name)) throw new Error(`${name} must be a command name or an absolute path`)
+  // `names` is in the order Windows tries them for one directory, and `fallback` only when none of them exists.
+  const extensions = windows ? windowsExtensions() : []
+  const named = extensions.some(extension => name.toLowerCase().endsWith(extension))
+  const names = windows && !named ? extensions.map(extension => `${name}${extension}`) : [name]
+  const fallback = windows && !named ? [name] : []
+  const directories = isAbsolute(name) ? [''] : path.split(delimiter).filter(dir => isAbsolute(dir) && !(exclude && sameDirectory(dir, exclude)))
+  const candidates = [...directories.flatMap(dir => names.map(candidate => join(dir, candidate))), ...directories.flatMap(dir => fallback.map(candidate => join(dir, candidate)))]
   for (const candidate of candidates) {
-    try { if (statSync(candidate).isFile()) { accessSync(candidate, constants.X_OK); return candidate } }
-    catch { /* Not an executable file here; try the next PATH directory. */ }
+    try {
+      if (!statSync(candidate).isFile()) continue
+      // Windows has no execute bit: any readable file of a PATHEXT extension or an image is executable.
+      accessSync(candidate, windows ? constants.F_OK : constants.X_OK)
+      return candidate
+    } catch { /* Not an executable file here; try the next PATH directory. */ }
   }
   throw new Error(`${name} is not an executable file${isAbsolute(name) ? '' : ' on PATH'}`)
 }
 
-export type Probe = (argv: string[]) => Promise<string>
+export type Probe = (argv: string[], env?: Record<string, string>) => Promise<string>
 /** Run startup checks through DSH's worker subprocess service with worker shims removed from PATH so a `gh` wrapper script reaches the real binary. */
 export function workerProbe(subprocess: SubprocessRuntime, stateDir: string, cwd: string, signal: AbortSignal): Probe {
   const path = withoutDirectory(process.env.PATH ?? '', workerBin(stateDir))
-  return argv => runAsWorker(subprocess, ['env', `PATH=${path}`, ...argv], cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]))
+  // The environment travels with the subprocess: Windows has no `env` command to set PATH on the command line.
+  return (argv, env) => runAsWorker(subprocess, argv, cwd, AbortSignal.any([signal, AbortSignal.timeout(60_000)]), { PATH: path, ...env })
 }
 
 const GithubUser = z.object({ login: z.string().regex(/^[A-Za-z0-9-]+$/), id: z.number().int().positive() })
@@ -117,7 +141,8 @@ export async function resolveFeishuBot(machine: Machine, feishu: unknown, probe:
   const fail = (error: unknown): never => { throw error instanceof SetupError ? error : new SetupError('feishuCliFailed', { output: reason(error) }) }
   let cli = ''
   try { cli = executable(name, path, workerBin(machine.stateDir)) } catch (error) { fail(error) }
-  const run = (...args: string[]): Promise<string> => probe(['env', 'LARKSUITE_CLI_NO_UPDATE_NOTIFIER=1', 'LARKSUITE_CLI_NO_SKILLS_NOTIFIER=1', cli, ...args]).catch(fail)
+  const run = (...args: string[]): Promise<string> => probe([cli, ...args],
+    { LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' }).catch(fail)
   const text = await run('auth', 'status')
   const status = parsed(AuthStatus, text.slice(text.indexOf('{')))
   if (!status) return fail(new SetupError('feishuNoApp'))
