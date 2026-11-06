@@ -2,6 +2,7 @@
 import { z } from 'zod'
 import type { ThreadFact } from '../core/index.ts'
 import { validItems, type Commands, type Tally } from '../infra/commands.ts'
+import type { SourceCommands } from './commands.ts'
 import { CommentSchema, IssueSchema, isHumanLogin, reviewPlace, type GithubComment } from './github-trigger.ts'
 import type { ContextMessage, ThreadContext } from './kind.ts'
 
@@ -57,7 +58,7 @@ export async function readRepositoryPath(commands: Commands, path: string, kind:
 }
 
 /** Reads check runs and commit statuses for a commit without emitting a trigger. */
-export async function pullChecks(commands: Commands, head: string, tally?: Tally): Promise<CiSnapshot> {
+export async function pullChecks(commands: SourceCommands, head: string, tally?: Tally): Promise<CiSnapshot> {
   const page = z.looseObject({ check_runs: z.array(z.unknown()) })
   const pages = await commands.api(z.array(page), `commits/${head}/check-runs?per_page=100`, '--paginate', '--slurp')
   const runs = validItems(CheckSchema, pages.flatMap(page => page.check_runs), tally)

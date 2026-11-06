@@ -5,12 +5,16 @@ import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, fe
   from '../src/sources/feishu.ts'
 import { KV } from '../src/kv.ts'
 import { apply as applyFeishu, pollThreads as pollFeishuThreads } from '../src/sources/feishu.ts'
-import { runFeishu, LIVE_RETRY_LIMIT, queueLiveEvent, retryLiveEvents, SEEN_LIMIT, takeLine } from '../src/sources/feishu-loops.ts'
-import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
+import { runFeishu, LIVE_RETRY_LIMIT, consumerEnvironment, diagnosticLine, queueLiveEvent, retryLiveEvents, SEEN_LIMIT, takeLine }
+  from '../src/sources/feishu-loops.ts'
+import { commentTrigger, githubAddress, githubChannel, githubCommentAddress, issueTrigger, type GithubComment, type GithubIssue }
+  from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
 import { ciCounts, ciFact, ciSummary } from '../src/sources/github-read.ts'
 import { apply as applyGithub, githubKind, limitBackoff, pollFailure, pollRound, rateLimitSeconds } from '../src/sources/github.ts'
 import { pollThreads as pollGithubThreads } from '../src/sources/github.ts'
+import { sourceContext } from '../src/sources/host.ts'
+import { topicEvent } from '../src/sources/feishu-trigger.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { cursorAt, POLL_HORIZON_MS } from '../src/sources/poll.ts'
 import { Store } from '../src/app/store.ts'
@@ -123,6 +127,27 @@ describe('feishu source', () => {
     expect(feishuRef(trigger)).toEqual({ triggerId: trigger.id, chatId: 'oc_1', messageId: 'om_2', at: trigger.at })
     expect(feishuTrigger({ message_id: 'om_3', chat_id: 'oc_1', chat_type: 'p2p', sender_id: 'ou_bot', sender_type: 'bot', content: 'me', create_time: '1' }, 'ou_bot', 'cli_bot')).toBeUndefined()
     expect(feishuTrigger(historyEvent({ message_id: 'om_4', chat_id: 'oc_1', create_time: '2', sender: { id: 'ou_x', sender_type: 'app' }, body: { content: '{"text":"from app"}' } }, 'oc_1', false), 'ou_bot', 'cli_bot')).toMatchObject({ human: false, text: 'from app', threads: [{ id: 'oc_1:om_4' }] })
+  })
+  it('keeps a message\'s Trigger ID when it is edited, and records the edit instead of asking again', () => {
+    const message = { message_id: 'om_edit', chat_id: 'oc_1', create_time: '1757376000000', sender: { id: MEMBER, sender_type: 'user' },
+      body: { content: '{"text":"first"}' } }
+    const at = '2026-09-09T00:00:00.000Z'
+    const created = feishuTrigger(historyEvent(message, 'oc_1', false), 'ou_bot', 'cli_bot')!
+    const edited = feishuTrigger(historyEvent({ ...message, updated: true, update_time: String(Date.parse(at)) }, 'oc_1', false), 'ou_bot', 'cli_bot')!
+    // The ID is the message's own, so the reply that answers it still correlates with it; the edit is recorded in `meta`.
+    expect(created.id).toBe(feishuTriggerId('om_edit'))
+    expect(edited.id).toBe(created.id)
+    expect(created.meta).not.toHaveProperty('edited')
+    expect(edited.meta).toMatchObject({ edited: true, editedAt: at })
+    // A live event states no edit state, and produces the same ID for the same message.
+    expect(feishuTrigger({ message_id: 'om_edit', chat_id: 'oc_1', chat_type: 'group', sender_id: MEMBER, sender_type: 'user',
+      content: 'first', create_time: '1757376000000' }, 'ou_bot', 'cli_bot')!.id).toBe(created.id)
+    // A topic page records the edit too, so the same read of an edited reply marks it.
+    const topic = feishuTrigger(topicEvent({ message_id: 'om_edit', chat_id: 'oc_1', msg_type: 'text', content: 'first',
+      sender: { id: MEMBER, sender_type: 'user' }, create_time: '1757376000000', updated: true,
+      update_time: String(Date.parse(at)) }, 'oc_1', false, 'om_edit'), 'ou_bot', 'cli_bot')!
+    expect(topic.meta).toMatchObject({ edited: true, editedAt: at })
+    expect(topic.id).toBe(created.id)
   })
   it('polls subscribed threads and stores unseen replies as triggers on that thread', async () => {
     const h = host()
@@ -409,6 +434,16 @@ describe('feishu source', () => {
     expect(h.store.get('feishu-live-retry')).toBeUndefined()
     expect(receive).toHaveBeenCalledWith(expect.objectContaining({ id: key('feishu', 'om_kept'), text: '@bot fix' }))
     expect(h.health.feishu).toMatchObject({ state: 'ready', detail: 'Listening for bot events; 1 kept event recovered' })
+    // A chat the Source does not configure and recovers no history for keeps its failed event too: it is not lost with the
+    // history it would never be recovered from.
+    const unlisted = JSON.stringify({ message_id: 'om_unlisted', chat_id: 'oc_other', chat_type: 'group', sender_id: MEMBER,
+      sender_type: 'user', content: 'fix', create_time: String(Date.now()), mentions: [{ id: 'ou_bot' }] })
+    failing = true
+    expect(await takeLine(ctx, unlisted, new AbortController().signal)).toBe(true)
+    failing = false
+    expect(await retryLiveEvents(ctx)).toBe(1)
+    expect(receive).toHaveBeenCalledWith(expect.objectContaining({ id: key('feishu', 'om_unlisted'),
+      meta: expect.objectContaining({ chatId: 'oc_other' }) }))
     h.store.close()
   })
   it('abandons a kept live event after a day and bounds how many it keeps, naming both in the health', async () => {
@@ -433,6 +468,27 @@ describe('feishu source', () => {
     expect(consumerRetry(1000, 500)).toBe(2000)
     expect(consumerRetry(32_000, 500)).toBe(60_000)
     expect(consumerRetry(60_000, 120_000)).toBe(1000)
+  })
+  it('gives the live consumer only the environment it needs, and reports its diagnostics redacted and short', () => {
+    const environment = consumerEnvironment({ PATH: '/bin', HOME: '/home/u', SystemRoot: 'C:\\Windows',
+      USERPROFILE: 'C:\\Users\\u', GH_TOKEN: 'ghp_secret', GITHUB_TOKEN: 'ghp_secret', AWS_SECRET_ACCESS_KEY: 'aws',
+      LARKSUITE_CLI_CONFIG_DIR: '/home/u/.lark-cli-bot', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '0', UNRELATED: 'value' } as NodeJS.ProcessEnv)
+    expect(environment).toMatchObject({ PATH: '/bin', HOME: '/home/u', SystemRoot: 'C:\\Windows',
+      LARKSUITE_CLI_CONFIG_DIR: '/home/u/.lark-cli-bot', LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1' })
+    // The agent's credentials, and anything else the CLI does not need, stay out of the consumer.
+    expect(environment).not.toHaveProperty('GH_TOKEN')
+    expect(environment).not.toHaveProperty('GITHUB_TOKEN')
+    expect(environment).not.toHaveProperty('AWS_SECRET_ACCESS_KEY')
+    expect(environment).not.toHaveProperty('UNRELATED')
+    // A credential the CLI echoes is redacted, and a wall of output is cut to what health can show.
+    expect(diagnosticLine('WARN app_secret=abcd1234 tenant_access_token=t-xyz request failed'))
+      .toBe('WARN app_secret=[redacted] tenant_access_token=[redacted] request failed')
+    expect(diagnosticLine('Authorization: Bearer abcdef')).not.toContain('abcdef')
+    expect(diagnosticLine('password: "hunter2"')).toBe('password: [redacted]')
+    const long = diagnosticLine(`${'x'.repeat(400)} app_secret=abc`)
+    expect(long).toHaveLength(241)
+    expect(long.endsWith('…')).toBe(true)
+    expect(long).not.toContain('abc')
   })
   it('syncs its part of the Policy from the sync chat: people who left are removed, names follow the chat, new people are appended', async () => {
     const h = host()
@@ -478,6 +534,13 @@ describe('github source', () => {
       'https://github.com/acme/widgets/pull/7/files', '']) {
       expect(githubAddress(url, 'acme/widgets')).toBeUndefined()
     }
+    // A comment address names only the comment; reading it is what names the Issue or PR it belongs to.
+    expect(githubCommentAddress('https://api.github.com/repos/acme/widgets/pulls/comments/55', 'acme/widgets'))
+      .toEqual({ kind: 'pulls', id: 55 })
+    expect(githubCommentAddress('https://api.github.com/repos/Acme/Widgets/issues/comments/66', 'acme/widgets'))
+      .toEqual({ kind: 'issues', id: 66 })
+    expect(githubCommentAddress('https://api.github.com/repos/acme/gadgets/pulls/comments/55', 'acme/widgets')).toBeUndefined()
+    expect(githubCommentAddress('https://api.github.com/repos/acme/widgets/pulls/7', 'acme/widgets')).toBeUndefined()
   })
   it('matches a branch to a ticket by its short name as the last path segment', () => {
     expect(ticketBranch({ execution: execution('fix-title-1a2b3c') }, 'agent/fix-title-1a2b3c')).toBe(true)
@@ -672,6 +735,43 @@ describe('github source', () => {
     expect(h.receive.mock.calls[0]![0]).toMatchObject({ actor: { id: 'carol' }, text: 'APPROVED review of commit abc123', meta: { kind: 'review' } })
     h.store.close()
   })
+  it('reads reviews from their newest page back, and stops at the first page that was already read', async () => {
+    const h = host()
+    h.store.set('github-since', '2026-09-08T00:00:00.000Z')
+    const review = (id: number, submitted: string) => ({ id, body: `review ${id}`, user: { login: 'carol', type: 'User' },
+      html_url: `https://github.com/acme/widgets/pull/7#discussion_r${id}`, submitted_at: submitted, state: 'COMMENTED' })
+    // GitHub lists reviews oldest first; pages 1-6 are behind the cursor, and only pages 7 and 8 hold reviews since it.
+    const pages: Record<number, unknown[]> = {
+      1: [review(1, '2026-09-01T00:00:00Z'), review(2, '2026-09-01T00:01:00Z')],
+      7: [review(70, '2026-09-07T00:00:00Z'), review(71, '2026-09-09T00:00:00Z')],
+      8: [review(80, '2026-09-09T01:00:00Z'), review(81, '2026-09-09T02:00:00Z')],
+    }
+    const reads: string[] = []
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const path = args[1]!.replace(/^repos\/acme\/widgets\//, '')
+      reads.push(path)
+      const bare = path.split('?')[0]!
+      if (bare === 'notifications') return `HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\n\r\n${JSON.stringify([notification(7, 'pulls')])}`
+      if (bare === 'pulls/7') return JSON.stringify(openPull(7))
+      if (bare === 'pulls/7/reviews') {
+        const page = Number(/[?&]page=(\d+)/.exec(path)?.[1] ?? 1)
+        const body = JSON.stringify(pages[page] ?? [])
+        if (args.includes('--include')) {
+          return 'HTTP/2.0 200 OK\r\nLink: <https://api.github.com/repos/acme/widgets/pulls/7/reviews?per_page=100&page=2>; rel="next", <https://api.github.com/repos/acme/widgets/pulls/7/reviews?per_page=100&page=8>; rel="last"\r\n\r\n' + body
+        }
+        return body
+      }
+      return JSON.stringify(args.includes('--slurp') ? [[]] : [])
+    })
+    await pollRound(h)
+    // The last page comes first, then the one before it, which holds the last review from before the cursor: pages 2-6 are
+    // never requested, and no new review can be missed because a new one is always appended to the last page.
+    expect(reads.filter(path => path.startsWith('pulls/7/reviews'))).toEqual(['pulls/7/reviews?per_page=100',
+      'pulls/7/reviews?per_page=100&page=8', 'pulls/7/reviews?per_page=100&page=7'])
+    expect(h.receive.mock.calls.map(([trigger]) => [trigger.text, trigger.meta.kind]))
+      .toEqual([['review 71', 'review'], ['review 80', 'review'], ['review 81', 'review']])
+    h.store.close()
+  })
   it('reads each PR once per round and takes its end, auto-merge and CI from that read', async () => {
     const h = host()
     h.store.tickets.save({ ...openTicket('t9'), ...pulled(9) })
@@ -829,8 +929,8 @@ describe('github source', () => {
       repository: { full_name: 'acme/widgets' }, subject: { url, type: 'Commit', title: '' } })
     github(h, { notifications: [
       subject('https://api.github.com/repos/acme/widgets/commits/abc'),
-      // A review comment thread addresses a PR, but the comment itself is a discussion this Source does not read.
-      subject('https://github.com/acme/widgets/pull/7#discussion_r5'),
+      // A comment notification whose comment no longer exists cannot name a thread, and is counted like the others.
+      subject('https://api.github.com/repos/acme/widgets/pulls/comments/99'),
       // A notification of another repository is not this Source's to read, and is not counted.
       { ...subject('https://api.github.com/repos/acme/gadgets/issues/9'), repository: { full_name: 'acme/gadgets' } },
     ] })
@@ -838,6 +938,39 @@ describe('github source', () => {
     expect(h.receive).not.toHaveBeenCalled()
     expect(h.health.github).toMatchObject({ state: 'ready',
       detail: '3 notifications; next poll ≥ 60s; 2 notifications of threads this Source does not read' })
+    h.store.close()
+  })
+  it('reads a review comment a notification names, on the PR it belongs to', async () => {
+    const h = host()
+    h.store.set('github-since', '2026-09-08T00:00:00.000Z')
+    const comment = (id: number, pr: number) => ({ id, body: `inline ${id}`, user: { login: 'carol', type: 'User' },
+      html_url: `https://github.com/acme/widgets/pull/${pr}#discussion_r${id}`, created_at: '2026-09-09T00:00:00Z',
+      updated_at: '2026-09-09T00:00:00Z' })
+    const subject = (url: string) => ({ id: `n-${url}`, updated_at: '2026-09-09T00:00:00Z', reason: 'comment',
+      repository: { full_name: 'acme/widgets' }, subject: { url, type: 'PullRequestReviewComment', title: '' } })
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const path = args[1]!.replace(/^repos\/acme\/widgets\//, '')
+      const bare = path.split('?')[0]!
+      if (bare === 'notifications') return `HTTP/2.0 200 OK\r\n\r\n${JSON.stringify([
+        // The notification names the comment itself; reading that comment finds its PR.
+        subject('https://api.github.com/repos/acme/widgets/pulls/comments/55'),
+        // A review comment's page address already names its PR.
+        subject('https://github.com/acme/widgets/pull/8#discussion_r66'),
+      ])}`
+      if (bare === 'pulls/comments/55') return JSON.stringify({ html_url: 'https://github.com/acme/widgets/pull/7#discussion_r55' })
+      if (bare === 'pulls/7') return JSON.stringify(openPull(7))
+      if (bare === 'pulls/8') return JSON.stringify(openPull(8))
+      // A paginated list arrives as one array per page.
+      if (bare === 'pulls/7/comments') return JSON.stringify(args.includes('--slurp') ? [[comment(55, 7)]] : [comment(55, 7)])
+      if (bare === 'pulls/8/comments') return JSON.stringify(args.includes('--slurp') ? [[comment(66, 8)]] : [comment(66, 8)])
+      if (bare === 'pulls/7/reviews' || bare === 'pulls/8/reviews') return args.includes('--include') ? 'HTTP/2.0 200 OK\r\n\r\n[]' : '[]'
+      return JSON.stringify(args.includes('--slurp') ? [[]] : [])
+    })
+    await pollRound(h)
+    expect(h.receive.mock.calls.map(([trigger]) => [trigger.meta.number, trigger.meta.commentId, trigger.meta.kind]).sort())
+      .toEqual([[7, 55, 'inline'], [8, 66, 'inline']])
+    // Both notifications named a comment the Source now reads, so neither is counted as unreadable.
+    expect(h.health.github).toMatchObject({ state: 'ready', detail: '2 notifications; next poll ≥ 60s' })
     h.store.close()
   })
   it('drops a notified Issue whose reads fail for a day, so the Source leaves the error, and keeps its read position', async () => {
@@ -1175,6 +1308,27 @@ describe('source context', () => {
     expect(() => github.report('feishu', { state: 'error', detail: 'x' })).toThrow('no health entry feishu')
     h.store.close()
   })
+  it('gives a plugin only the command surface a Source may use, and runs its reads through the deployment', async () => {
+    const h = host()
+    const context = sourceContext(h, githubKind)
+    // The unrestricted runner (a program of the plugin's choosing) is not part of what a plugin receives.
+    expect(Object.keys(context.commands).sort()).toEqual(['api', 'deployment', 'lark', 'pages', 'withSignal'])
+    expect('run' in context.commands).toBe(false)
+    expect('gh' in context.commands).toBe(false)
+    expect('git' in context.commands).toBe(false)
+    // The reads a Source does use still go through the deployment's commands, with the same arguments.
+    const lark = vi.spyOn(h.commands, 'lark').mockResolvedValue({ ok: true })
+    expect(await context.commands.lark(['im', '+chat-list'])).toEqual({ ok: true })
+    expect(lark).toHaveBeenCalledWith(['im', '+chat-list'])
+    expect(context.commands.deployment.repository).toBe('acme/widgets')
+    const pages = vi.spyOn(Commands.prototype, 'pages').mockResolvedValue([{ id: 1 }])
+    const scoped = context.commands.withSignal(new AbortController().signal)
+    expect(Object.keys(scoped).sort()).toEqual(['api', 'deployment', 'lark', 'pages', 'withSignal'])
+    expect(await scoped.pages(githubKind.schema, 'issues/7/comments')).toEqual([{ id: 1 }])
+    expect(pages).toHaveBeenCalledWith(githubKind.schema, 'issues/7/comments')
+    pages.mockRestore()
+    h.store.close()
+  })
   it('patches a Thread\'s meta as it is now, so a change another writer made meanwhile stays', () => {
     const h = host()
     h.store.threads.save({ key: 'github:7', ref: { source: 'github', id: '7' }, createdAt: '', subscriptions: [], correlated: [],
@@ -1506,6 +1660,9 @@ describe('observing the GitHub repository', () => {
     // The horizon, on the hour.
     expect(Date.now() - POLL_HORIZON_MS - since).toBeGreaterThanOrEqual(0)
     expect(Date.now() - POLL_HORIZON_MS - since).toBeLessThan(3_600_000)
+    // The history dropped by starting at the horizon is named in the health instead of vanishing.
+    expect(h.health.github).toMatchObject({ state: 'ready',
+      detail: expect.stringContaining('history before the 14-day window not read: issues') })
     h.store.close()
   })
   it('starts the default branch\'s CI afresh when the default branch is renamed, without a Trigger', async () => {

@@ -90,3 +90,21 @@ it('reads the chat around a message by time: five before it, the message and fiv
   expect('messages' in earlier && earlier.messages.map(message => message.id)).toEqual(['om_-7', 'om_-6'])
   expect(params(4)).toMatchObject({ page_token: 'older', page_size: 10 })
 })
+it('says a chat page is truncated when Feishu reports more but gives no page to continue from', async () => {
+  const at = Date.parse('2026-09-11T12:00:00Z')
+  const item = (n: number) => ({ message_id: `om_${n}`, chat_id: 'oc_chat', create_time: String(at + n * 1000),
+    sender: { id: 'ou_user', sender_type: 'user' }, body: { content: JSON.stringify({ text: `message ${n}` }) } })
+  const ref = { ...event, at: new Date(at).toISOString() }
+  const lark = vi.spyOn(commands, 'lark').mockResolvedValueOnce({ items: [source] })
+    .mockResolvedValueOnce({ items: [item(0)], has_more: true })
+    .mockResolvedValueOnce({ items: [item(1)], has_more: false })
+  const around = await feishuRead(commands, ref, 'feishu/source/around', 20)
+  // The messages Feishu sent are still returned, with a status and a note saying they are not the whole range.
+  expect(around).toMatchObject({ status: 'truncated', next_resource: null, messages: [{ id: 'om_0' }, { id: 'om_1' }] })
+  expect('note' in around && around.note).toContain('without a page to continue from')
+  // A page whose token is the one already read is the same case, not a page to follow.
+  lark.mockResolvedValueOnce({ items: [source] }).mockResolvedValueOnce({ items: [item(0)], has_more: true, page_token: 'older' })
+  const again = await feishuRead(commands, ref, 'feishu/source/around/older', 20)
+  expect(again).toMatchObject({ status: 'truncated', next_resource: null, messages: [{ id: 'om_0' }] })
+  expect('note' in again && again.note).toContain('without a page to continue from')
+})

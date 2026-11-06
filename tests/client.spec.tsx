@@ -5,6 +5,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { ApiError, caller, usePoll } from '../src/client/api.ts'
 import { apply } from '../src/client/index.tsx'
 import { zh } from '../src/client/locales.ts'
+import { channelIcon } from '../src/client/ticket.tsx'
 import { SettingsSchema } from '../src/policy.ts'
 
 declare global { var IS_REACT_ACT_ENVIRONMENT: boolean }
@@ -75,6 +76,26 @@ it('reports a Session missing from the catalog in the interface language', async
   await openMaster(view.container)
   expect(ctx.uiWorkspace.openSession).not.toHaveBeenCalled()
   expect(document.body.textContent).toContain(zh.sessionNotListed)
+  view.dispose()
+})
+
+it('marks a Channel link with the icon of its own Source, and a Source it does not know as a message', () => {
+  expect(channelIcon('github')).toBe('pull')
+  expect(channelIcon('feishu')).toBe('message')
+  expect(channelIcon('someone-else')).toBe('message')
+})
+
+it('reads the interface language from the dictionary, not from a translation two languages could share', async () => {
+  serve()
+  const { main } = fixture([])
+  // A dictionary that reports English while wording the tab as the Chinese one does: the glossary must still show English first.
+  const mixed = (key: string) => key === 'lang' ? 'en' : (zh as Record<string, string>)[key] ?? key
+  const view = await render(main, { t: mixed })
+  const open = [...view.container.querySelectorAll('button')].find(item => item.getAttribute('aria-label') === zh.glossary)!
+  await act(async () => { open.click() })
+  for (let i = 0; i < 5; i++) await act(async () => { await new Promise(resolve => setTimeout(resolve, 0)) })
+  const headers = [...document.querySelectorAll('.dt-glossary thead th')].map(cell => cell.textContent)
+  expect(headers.slice(0, 2)).toEqual([zh.glossaryEnglish, zh.glossaryChinese])
   view.dispose()
 })
 

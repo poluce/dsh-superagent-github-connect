@@ -79,6 +79,33 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
 export const consumerRetry = (previous: number | undefined, ranMs: number): number =>
   previous === undefined || ranMs >= 60_000 ? 1000 : Math.min(previous * 2, 60_000)
 /**
+ * Variables the live consumer inherits: where the platform's programs and temporary files are, proxy settings, and the
+ * CLI's own switches (`LARKSUITE_CLI_*`, which include the bot's configuration directory). Everything else in the process
+ * environment, notably the GitHub token and the agent's credentials, is not handed to a process this Source spawns itself.
+ */
+const CONSUMER_ENV = new Set(['path', 'pathext', 'path_ext', 'home', 'userprofile', 'username', 'appdata', 'localappdata',
+  'tmpdir', 'temp', 'tmp', 'systemroot', 'systemdrive', 'comspec', 'node_options', 'node_extra_ca_certs', 'ssl_cert_file',
+  'ssl_cert_dir', 'http_proxy', 'https_proxy', 'all_proxy', 'no_proxy', 'lang', 'lc_all', 'language', 'tz'])
+/** The environment of the event consumer: the variables above, the CLI's own switches, and whatever `extra` adds. */
+export function consumerEnvironment(environment: NodeJS.ProcessEnv, extra: Record<string, string> = {}): Record<string, string> {
+  const inherited = Object.entries(environment).flatMap(([name, value]) => value === undefined ? []
+    : CONSUMER_ENV.has(name.toLowerCase()) || name.toUpperCase().startsWith('LARKSUITE_CLI_') ? [[name, value] as const] : [])
+  return { ...Object.fromEntries(inherited), LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1', LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1', ...extra }
+}
+/** Longest diagnostic kept on health: enough to name a failure, not the CLI's whole output. */
+const DIAGNOSTIC_LIMIT = 240
+/** A credential-shaped assignment such as `app_secret=…`, `"tenant_access_token": "…"`, or `password: …`. */
+const CREDENTIAL = /((?:app|client|tenant|access|refresh|user)?[_-]?(?:secret|token|password|credential)\s*[=:]\s*)("?[^\s",;]+"?)/gi
+/**
+ * One line of the consumer's diagnostics, safe to report: credentials are redacted and the line is cut short, so a CLI that
+ * echoes a token or prints a wall of output cannot put it on the Source's health, the panel, or the log.
+ */
+export function diagnosticLine(line: string, limit = DIAGNOSTIC_LIMIT): string {
+  const redacted = line.replace(/\b(?:Bearer|Basic)\s+\S+/gi, 'Bearer [redacted]').replace(CREDENTIAL,
+    (_match, prefix: string) => `${prefix}[redacted]`)
+  return redacted.length > limit ? `${redacted.slice(0, limit)}…` : redacted
+}
+/**
  * A live event whose handling failed: its raw line is kept in the Source's own KV so a later pass delivers it.
  * `attempts` counts the retries that also failed, and `failedAt` is when the first failure happened.
  */
@@ -178,8 +205,7 @@ export async function retryLiveEvents(ctx: SourceContext, signal?: AbortSignal, 
 async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   const invocation = spawnInvocation([bot(ctx).cli, 'event', 'consume', 'im.message.receive_v1', '--as', 'bot'])
   const child = spawn(invocation.argv[0]!, invocation.argv.slice(1),
-    { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LARKSUITE_CLI_NO_UPDATE_NOTIFIER: '1',
-      LARKSUITE_CLI_NO_SKILLS_NOTIFIER: '1', ...invocation.env } })
+    { stdio: ['pipe', 'pipe', 'pipe'], env: consumerEnvironment(process.env, invocation.env) })
   const stdout = createInterface({ input: child.stdout }); const stderr = createInterface({ input: child.stderr })
   let chain = Promise.resolve(); let diagnostic = ''; let ready = false
   let retrying: ReturnType<typeof setTimeout> | undefined
@@ -204,7 +230,8 @@ async function consume(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   drain()
   const timeout = setTimeout(() => { diagnostic = 'Feishu event consumer did not become ready within 45 seconds'; stop() }, 45_000)
   stderr.on('line', (line: string) => {
-    diagnostic = line.slice(0, 4000)
+    // The CLI's own output may echo credentials and can be long: only a redacted, short form reaches health.
+    diagnostic = diagnosticLine(line)
     if (line.startsWith('[event] ready')) {
       ready = true; clearTimeout(timeout)
       ctx.report('feishu', { state: 'ready', detail: 'Listening for bot events', at: new Date().toISOString() })

@@ -26,7 +26,8 @@ export interface AppProps {
 
 function Glossary({ open, onClose }: { open: boolean; onClose: () => void }) {
   const { t } = usePanel()
-  const chinese = t('tab.overview') === zh['tab.overview']
+  // The interface language is the dictionary's own answer, not a guess from a translation that two languages might share.
+  const chinese = t('lang') === 'zh'
   const [own, other] = chinese ? [zh, en] : [en, zh]
   const heading = (group: keyof typeof GLOSSARY) => t(group === 'roles' ? 'glossaryGroup.roles' : `tab.${group}`)
   return <Modal className="dt-glossary-modal" open={open} onClose={onClose} title={t('glossary')} closeLabel={t('close')}

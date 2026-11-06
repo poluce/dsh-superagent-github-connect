@@ -1,6 +1,7 @@
 /** Host and context interfaces connecting Source plugins to the application; also imported by the web panel, so it must not import Node-only modules. */
 import type { ChannelRef, ReceiveResult, OutboundMessage, Thread, ThreadFact, ThreadRef, Ticket, Trigger } from '../core/index.ts'
-import type { Commands } from '../infra/commands.ts'
+import type { SourceCommands } from './commands.ts'
+import { sourceCommands } from './commands.ts'
 import type { Deployment } from '../deployment.ts'
 import type { SourceRegistry } from './registry.ts'
 import type { SetupProblem } from '../setup.ts'
@@ -30,7 +31,8 @@ export interface ThreadDescription { label?: string; url?: string; facts?: Recor
 /** Application capabilities exposed to a Source kind for reading state, ingesting triggers, managing threads/tickets, and reporting health. */
 export interface SourceContext {
   readonly deployment: Deployment
-  readonly commands: Commands
+  /** The deployment's commands narrowed to what a Source may use; see `SourceCommands`. */
+  readonly commands: SourceCommands
   readonly ready: Promise<void>
   /** True once setup resolved the repository and accounts; Sources poll only then. */
   configured(): boolean
@@ -64,4 +66,8 @@ export interface SourceContext {
   /** Reports the state of one of this kind's declared health entries; throws for undeclared entry names. */
   report(entry: string, health: Health): void
 }
-export const sourceContext = (host: SourceHost, kind: { kind: string; health: readonly string[] }): SourceContext => host.context(kind)
+/** Builds a kind's context and narrows its command surface, so a plugin cannot reach the unrestricted runner. */
+export const sourceContext = (host: SourceHost, kind: { kind: string; health: readonly string[] }): SourceContext => {
+  const context = host.context(kind)
+  return Object.assign(context, { commands: sourceCommands(context.commands) })
+}

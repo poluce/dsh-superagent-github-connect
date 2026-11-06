@@ -16,6 +16,15 @@ export function githubAddress(url: string, repository: string): { number: number
   if (!match || !sameName(match[1]!, repository)) return undefined
   return { number: Number(match[3]), pr: match[2]!.toLowerCase() !== 'issues', ...match[4] ? { discussion: Number(match[4]) } : {} }
 }
+/**
+ * Parses an API URL that names a comment rather than its Issue or PR, such as a review comment's `pulls/comments/<id>`
+ * from a notification; reading that comment names the Issue or PR it belongs to.
+ */
+export function githubCommentAddress(url: string, repository: string): { kind: 'issues' | 'pulls'; id: number } | undefined {
+  const match = /^https:\/\/api\.github\.com\/repos\/([^/]+\/[^/]+)\/(issues|pulls)\/comments\/(\d+)\/?$/i.exec(url)
+  if (!match || !sameName(match[1]!, repository)) return undefined
+  return { kind: match[2]!.toLowerCase() as 'issues' | 'pulls', id: Number(match[3]) }
+}
 /** GitHub returns a deleted account as `null` and displays it as `ghost`. */
 export const UserSchema = z.looseObject({ login: z.string(), type: z.string().optional() }).nullable()
   .transform(user => user ?? { login: 'ghost', type: 'User' })
