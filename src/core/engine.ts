@@ -70,17 +70,32 @@ export class Engine {
    * Requeues overdue Evals up to `REQUEUES` times before recording `unavailable` (undelivered Evals never expire), starts the
    * Evals of Threads whose queued Triggers wait, and resumes ended tickets a person's message reached while processing was
    * paused. While processing is paused, nothing expires: each Eval in progress notes when the pause began, and its deadline
-   * moves forward by the pause's length once processing resumes. Each Eval and each ticket update takes one transaction.
+   * moves forward by the pause's length once processing resumes. Each Eval and each ticket update takes one transaction that
+   * reads the Thread or the ticket again inside it, so no work here uses the snapshot the pass listed it from. Only a person's
+   * message resumes an ended ticket, so the others are left alone.
    */
   evaluateDue(): void {
     const policy = this.options.policy()
-    for (const thread of this.repo.threads.active()) if (thread.evaluating) this.repo.atomic(() => { this.evals.due(thread, policy) })
+    for (const thread of this.repo.threads.active()) {
+      if (!thread.evaluating) continue
+      this.repo.atomic(() => {
+        const current = this.repo.threads.get(thread.key)
+        if (current?.evaluating) this.evals.due(current, policy)
+      })
+    }
     if (policy.paused) return
     for (const ticket of this.repo.tickets.active()) {
-      if (!liveTicket(ticket) && ticket.undelivered.length) this.repo.atomic(() => { this.tickets.wake(ticket.id) })
+      if (liveTicket(ticket) || !ticket.undelivered.length) continue
+      // Only a person's message resumes an ended ticket; one that waits for a bot's or CI's is read no more on every pass.
+      if (!ticket.undelivered.some(id => { const input = ticket.inputs.find(item => item.id === id); return input?.kind === 'trigger' && input.human })) continue
+      this.repo.atomic(() => { this.tickets.wake(ticket.id) })
     }
     for (const thread of this.repo.threads.active()) {
-      if (thread.pending.length && !thread.evaluating) this.repo.atomic(() => { this.evals.start(thread.key, policy) })
+      if (!thread.pending.length || thread.evaluating) continue
+      this.repo.atomic(() => {
+        const current = this.repo.threads.get(thread.key)
+        if (current?.pending.length && !current.evaluating) this.evals.start(current.key, policy)
+      })
     }
   }
 

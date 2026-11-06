@@ -71,16 +71,21 @@ export class Tickets extends EnginePart {
     return ticket
   }
   /**
-   * Record that a Thread open tickets follow closed, and end each one done with its Threads (see `followsDone`), unless its
-   * work has not finished (see `unfinished`); such work ends the ticket once it reports ready.
+   * Record that a Thread tickets follow closed, and end each open one done with its Threads (see `followsDone`), unless its
+   * work has not finished (see `unfinished`); such work ends the ticket once it reports ready. An ended ticket that does not
+   * a person stop keeps the fact too, without changing how it ended: the work a later person's message resumes ends as the
+   * close did (see `report`), so losing the close here would leave that work unable to end.
    */
   threadClosed(thread: ThreadRef, outcome: 'merged' | 'closed', at: string): void {
     const closed = threadKey(thread)
-    for (const ticket of this.repo.tickets.open()) {
+    for (const ticket of this.repo.tickets.list()) {
+      if (!liveTicket(ticket) && ticket.ended?.by === 'human') continue
       const follow = ticket.follows?.find(item => item.thread === closed && !item.closed)
       if (!follow) continue
       follow.closed = { at, outcome }
       this.repo.tickets.save(ticket)
+      // An ended ticket keeps the fact for the work a later message resumes; it ends no more.
+      if (!liveTicket(ticket)) continue
       const done = this.followsDone(ticket)
       if (!done || this.unfinished(ticket, at)) continue
       // Work resumed after the close and finished ends now.
@@ -341,6 +346,7 @@ export class Tickets extends EnginePart {
    * the person's messages it decides that its worker did not read before its latest report or turn end, the report that
    * ends the ticket included (see `readBefore`), and neither acknowledged, answered nor handed back: one may have come while
    * the worker wrote the report that ends the ticket, or after its turn ended, and either way it can no longer hand it back.
+   * Its open question is withdrawn from the outbox, as a report that replaces one does (see `Assignments.report`).
    */
   end(ticketId: string, by: TicketEndBy, outcome: TicketOutcome, at = this.now(), reason?: string): void {
     const ticket = this.require(ticketId)
@@ -348,6 +354,7 @@ export class Tickets extends EnginePart {
     const stopping = ticket.assignments.filter(assignment => assignment.state !== 'ended')
     const why = reason && reason !== outcome ? { reason } : {}
     const until = readUntil(ticket)
+    const attention = ticket.attention
     const waiting = this.triggersOf(ticket, ticket.undelivered)
     const left = this.untaken(ticket, ticket.inputs.flatMap(input => input.kind === 'trigger'
       && (!readBefore(input, until) || ticket.undelivered.includes(input.id)) ? [input.id] : []))
@@ -357,6 +364,8 @@ export class Tickets extends EnginePart {
     // The Assignments the end stops end with it; the ticket's end says why.
     for (const assignment of stopping) { assignment.state = 'ended'; assignment.endedAt = at }
     this.repo.tickets.save(ticket)
+    // The question is moot now: an unsent question for a person goes out no more.
+    if (attention) this.replies.withdrawAttention(attention.id)
     this.letGo(ticketId, waiting, left)
     this.emit('ticket.ended', { ticketId, by, outcome, ...why })
     for (const assignment of stopping) this.options.executor.stop(ticket, assignment, reason ?? outcome)

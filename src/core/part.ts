@@ -15,6 +15,8 @@ export interface EngineOptions {
   prepareTicket?: (ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>) => Ticket
   now?: () => string
   emit?: (event: DomainEvent) => void
+  /** Reports a failing `emit` observer, which must not fail the domain command that emitted its event. */
+  onError?: (error: unknown, event: DomainEvent) => void
 }
 
 /**
@@ -61,8 +63,13 @@ export abstract class EnginePart {
     this.repo.threads.save(primary)
     return true
   }
+  /**
+   * Tell the host of a domain event inside the command's transaction. An observer that throws must not roll the command
+   * back, so its error goes to `onError` and the command stands.
+   */
   protected emit<K extends keyof DomainEvents>(type: K, data: DomainEvents[K]): void {
-    this.options.emit?.({ type, at: this.now(), data } as DomainEvent)
+    const event = { type, at: this.now(), data } as DomainEvent
+    try { this.options.emit?.(event) } catch (error) { this.options.onError?.(error, event) }
   }
   protected require(ticketId: string): Ticket { const ticket = this.repo.tickets.get(ticketId); if (!ticket) throw new UserError('unknownTicket'); return ticket }
   /** Returns the stored Thread or an unsaved empty Thread aggregate. */

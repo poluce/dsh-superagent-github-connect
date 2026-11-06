@@ -426,7 +426,7 @@ describe('github source', () => {
     expect(await observePull(h, endedPull(9, '2026-09-02T00:00:00Z'))).toBe(true)
     expect(h.store.tickets.get('t1')!.ended).toBeUndefined()
     // Once the resumed work reports ready, the ticket ends with the merged PR, at that time and without a second notice.
-    h.engine.report('t1', { state: 'ready', summary: 'answered' })
+    h.engine.report('t1', { assignmentId: 'a2', state: 'ready', summary: 'answered' })
     expect(h.store.tickets.get('t1')).toMatchObject({ ended: { outcome: 'merged' } })
     expect(Date.parse(h.store.tickets.get('t1')!.ended!.at)).toBeGreaterThan(Date.parse('2026-09-03T00:00:00Z'))
     // Its notice has the id of the first one, so it goes out once.
