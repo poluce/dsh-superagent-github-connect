@@ -49,18 +49,25 @@ export class Effects {
   private readonly tasks = new Set<Task>()
   /** Kinds whose last dispatch failed; the next dispatch that succeeds refreshes their health. */
   private readonly broken = new Set<EffectKind>()
+  /** The error of each kind's most recent failure, until a row of that kind succeeds; health names it. */
+  private readonly failures = new Map<EffectKind, string>()
   private seq: number
   private scheduled = false
   /** Effects run only between `start` and `drain`; rows queued before `start` wait, such as while setup is incomplete. */
   private started = false
   private stopped = false
-  constructor(private readonly store: Store, private readonly board: Pick<HealthBoard, 'claim'>, private readonly now = () => Date.now()) {
+  /**
+   * @param lifetime - Ends the queue besides `drain`, such as when the state directory lock is lost: no effect starts after it aborts.
+   */
+  constructor(private readonly store: Store, private readonly board: Pick<HealthBoard, 'claim'>, private readonly now = () => Date.now(),
+    private readonly lifetime?: AbortSignal) {
     this.seq = Number(store.db.prepare('SELECT IFNULL(MAX(seq), 0) AS seq FROM effect').get()?.seq ?? 0)
   }
   /** Upserts an effect in the caller's transaction, coalescing with any waiting row of the same kind and key while keeping its queue position. */
   enqueue<K extends EffectKind>(kind: K, key: string, payload: EffectPayloads[K]): void {
+    // A row queued again counts as waiting from its new payload, not from the payload it replaced.
     this.store.db.prepare(`INSERT INTO effect (kind, key, value, seq, due, since) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(kind, key) DO UPDATE
-      SET value = excluded.value, generation = generation + 1, attempts = 0, error = '', due = excluded.due`)
+      SET value = excluded.value, generation = generation + 1, attempts = 0, error = '', due = excluded.due, since = excluded.since`)
       .run(kind, key, JSON.stringify(payload), ++this.seq, this.now(), new Date(this.now()).toISOString())
     this.kick()
   }
@@ -80,9 +87,9 @@ export class Effects {
     this.store.db.prepare('DELETE FROM effect WHERE kind = ? AND key = ?').run(kind, key)
     this.store.afterCommit(() => { this.report(kind) })
   }
-  start(): void { this.started = true; this.kick() }
+  start(): void { if (this.lifetime?.aborted) return; this.started = true; this.kick() }
   kick(): void {
-    if (this.scheduled) return
+    if (this.scheduled || this.lifetime?.aborted) return
     this.scheduled = true
     queueMicrotask(() => { this.scheduled = false; this.dispatch() })
   }
@@ -101,7 +108,8 @@ export class Effects {
     await Promise.allSettled([...this.tasks].map(task => task.done))
   }
   private dispatch(): void {
-    if (!this.started || this.stopped) return
+    // A stopped queue starts nothing, and neither does one whose lifetime ended (such as after losing the state directory lock).
+    if (!this.started || this.stopped || this.lifetime?.aborted) return
     for (const [kind, handler] of this.handlers) {
       try {
         const running = new Set([...this.tasks].filter(task => task.kind === kind).map(task => task.key))
@@ -132,13 +140,14 @@ export class Effects {
     try { await handler.run(JSON.parse(row.value) as never, row.key) } catch (error) { failure = { error } }
     // Match seq and generation so a row replaced or re-queued while running is not overwritten.
     const own = 'kind = ? AND key = ? AND seq = ? AND generation = ?', ownRow = [kind, row.key, row.seq, row.generation] as const
-    if (!failure) this.store.db.prepare(`DELETE FROM effect WHERE ${own}`).run(...ownRow)
+    if (!failure) { this.store.db.prepare(`DELETE FROM effect WHERE ${own}`).run(...ownRow); this.failures.delete(kind) }
     // Leave running rows untouched on shutdown so they retry on the next start.
-    else if (this.stopped) return
+    else if (this.stopped || this.lifetime?.aborted) return
     else if (failure.error instanceof Later) {
       this.store.db.prepare(`UPDATE effect SET due = ? WHERE ${own}`).run(this.now() + handler.retry[0], ...ownRow)
     } else {
       const delay = Math.min(handler.retry[1], handler.retry[0] * 2 ** Math.min(row.attempts, 16))
+      this.failures.set(kind, String(failure.error).slice(0, 1000))
       this.store.db.prepare(`UPDATE effect SET attempts = attempts + 1, error = ?, due = ? WHERE ${own}`)
         .run(String(failure.error).slice(0, 1000), this.now() + delay, ...ownRow)
     }
@@ -148,14 +157,23 @@ export class Effects {
     this.broken.add(kind)
     this.health.get(kind)?.set({ state: 'error', detail: `The effect queue failed: ${String(error)}`, at: new Date(this.now()).toISOString() })
   }
+  /**
+   * Refreshes the kind's health entry from its queue: how many rows wait, since when the oldest one waits (a row queued
+   * again with a new payload waits from then), and the failure that happened last, which a restarted process did not see
+   * and reads from the row that failed most then.
+   */
   private report(kind: EffectKind): void {
-    const row = this.store.db.prepare(`SELECT COUNT(*) AS waiting, MIN(since) AS since, MAX(attempts) AS attempts,
-      (SELECT error FROM effect WHERE kind = ? AND attempts > 0 ORDER BY seq DESC LIMIT 1) AS error FROM effect WHERE kind = ?`).get(kind, kind)
+    const row = this.store.db.prepare(`SELECT COUNT(*) AS waiting, MIN(since) AS since, MAX(attempts) AS attempts
+      FROM effect WHERE kind = ?`).get(kind) as { waiting: number; since: string | null; attempts: number | null } | undefined
     const waiting = Number(row?.waiting ?? 0)
-    const failing = Number(row?.attempts ?? 0) >= FAILURES_BEFORE_ERROR && !this.handlers.get(kind)?.quiet
     const detail = waiting ? `${waiting} waiting since ${String(row?.since)}` : 'Nothing waiting'
-    this.health.get(kind)?.set(failing
-      ? { state: 'error', detail: `${detail}; the last failure: ${String(row?.error)}`, at: new Date(this.now()).toISOString() }
-      : { state: 'ready', detail, at: new Date(this.now()).toISOString() })
+    const at = new Date(this.now()).toISOString()
+    // Any row of the kind over the threshold makes the kind fail; a quiet kind reports its failures elsewhere.
+    if (Number(row?.attempts ?? 0) < FAILURES_BEFORE_ERROR || this.handlers.get(kind)?.quiet) {
+      this.health.get(kind)?.set({ state: 'ready', detail, at }); return
+    }
+    const last = this.failures.get(kind) ?? String((this.store.db.prepare(`SELECT error FROM effect WHERE kind = ? AND attempts > 0
+      ORDER BY attempts DESC, due DESC LIMIT 1`).get(kind) as { error?: string } | undefined)?.error ?? '')
+    this.health.get(kind)?.set({ state: 'error', detail: `${detail}; the last failure: ${last}`, at })
   }
 }

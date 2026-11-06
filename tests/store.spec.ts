@@ -178,6 +178,23 @@ it('reports an action that fails after a commit, runs the others, and keeps what
   store.close()
 })
 
+it('takes no nested level when the SAVEPOINT itself fails, so the next commit callbacks still run', () => {
+  const store = new Store(join(directory, 'orchestrator.sqlite'))
+  // A SAVEPOINT can fail before it opens anything, such as on a disk error. That must not count as a nested transaction:
+  // the depth it would leave behind silently swallows every later `afterCommit` action, and with it its in-memory side effects.
+  const exec = vi.spyOn(store.db, 'exec').mockImplementationOnce(() => { throw new Error('disk I/O error') })
+  try {
+    expect(() => store.atomic(() => { store.set('never', 1) })).toThrow('disk I/O error')
+  } finally { exec.mockRestore() }
+  expect(store.get('never')).toBeUndefined()
+  const ran: string[] = []
+  store.afterCommit(() => { ran.push('immediate') })
+  expect(ran).toEqual(['immediate'])
+  store.atomic(() => { store.afterCommit(() => { ran.push('committed') }); expect(ran).toEqual(['immediate']) })
+  expect(ran).toEqual(['immediate', 'committed'])
+  store.close()
+})
+
 it('closes a database it cannot open as this version\'s, so a later attempt can open it', () => {
   const path = join(directory, 'orchestrator.sqlite')
   const store = new Store(path)
@@ -188,6 +205,20 @@ it('closes a database it cannot open as this version\'s, so a later attempt can 
     expect(() => new Store(path)).toThrow('Unsupported orchestrator database version')
     expect(close).toHaveBeenCalledOnce()
   } finally { close.mockRestore() }
+})
+it('leaves a database it refuses as it found it: no tables of this version and no journal mode taken', () => {
+  const path = join(directory, 'orchestrator.sqlite')
+  const future = new DatabaseSync(path)
+  future.exec('CREATE TABLE kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+  future.prepare('INSERT INTO kv VALUES (?,?)').run(KV.store.schema, String(SCHEMA_VERSION + 1))
+  future.close()
+  expect(() => new Store(path)).toThrow('Unsupported orchestrator database version')
+  const raw = new DatabaseSync(path)
+  try {
+    expect(raw.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name <> 'kv'").all()).toEqual([])
+    // Switching the journal mode is persistent, so a database this build refuses must not be put in WAL.
+    expect(String(raw.prepare('PRAGMA journal_mode').get()?.journal_mode)).toBe('delete')
+  } finally { raw.close() }
 })
 it('keeps the settings as versions: the current settings are the snapshot of the current revision, kept nowhere else', () => {
   const store = new Store(join(directory, 'orchestrator.sqlite'))

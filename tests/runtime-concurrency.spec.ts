@@ -2,12 +2,27 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { latestAssignment, waitsForPerson, type Ticket, type Trigger } from '../src/core/index.ts'
 import { Later } from '../src/app/effects.ts'
+import { Passes, type PassesHost } from '../src/app/passes.ts'
+import { HealthBoard } from '../src/infra/health.ts'
 import { reportRelay } from '../src/app/notices.ts'
 import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
 import { SettingsSchema } from '../src/policy.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { deferred, waitUntil } from './fixtures/async.ts'
 import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
+
+/** The `onCompromised` callback each Runtime registered on its state directory lock. */
+const lockWatchers = vi.hoisted(() => new Map<string, (error: Error) => void>())
+// proper-lockfile reports a compromised lock from its update timer after `stale / 2` (15 s with the Runtime's settings), which a
+// test cannot wait for: keep the callback the Runtime registers and report the compromise to it, as that timer would.
+vi.mock('proper-lockfile', async importOriginal => {
+  const actual = await importOriginal<typeof import('proper-lockfile')>()
+  return { ...actual, lockSync: (file: string, options?: Parameters<typeof actual.lockSync>[1]) => {
+    const compromised = options?.onCompromised
+    if (compromised) lockWatchers.set(file, compromised)
+    return actual.lockSync(file, options)
+  } }
+})
 
 let h: Host
 beforeEach(async () => { h = await startRuntime() })
@@ -940,4 +955,64 @@ describe('the Executor\'s parts', () => {
     expect(ready.id).toMatch(/^report:/)
     expect(JSON.parse(ready.text)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: 't1' }, trigger_id: 'tr1', state: 'ready', answer_to: 'tr9', summary: 'Done' })
   })
+})
+
+it('stops the whole Runtime when its state directory lock is compromised, so nothing writes beside the new owner', async () => {
+  const compromised = lockWatchers.get(h.runtime.machine.stateDir)
+  expect(compromised).toBeTypeOf('function')
+  compromised!(Object.assign(new Error('Unable to update lock within the stale threshold'), { code: 'ECOMPROMISED' }))
+  // The Runtime reports the loss of the lock at once...
+  expect(h.runtime.health.runtime).toMatchObject({ state: 'error', detail: expect.stringContaining('Unable to update lock') })
+  // ...and stops for real: the database closes, so no pass, effect, or source writes beside the directory's new owner.
+  await vi.waitFor(() => expect(() => h.runtime.store.get('schema')).toThrow())
+  expect(() => h.runtime.receive(feishu('2', '@bot 修一'))).toThrow('Orchestrator is stopping')
+  // A later stop finds this one done rather than shutting down twice.
+  await expect(h.runtime.stop()).resolves.toBeUndefined()
+})
+
+it('runs no pass and starts no effect once the runtime lifetime ended, even before the closing flag is set', async () => {
+  const lifetime = new AbortController()
+  const kick = vi.fn(), evaluateDue = vi.fn()
+  const passes = new Passes({ engine: { receive: vi.fn(), evaluateDue }, effects: { kick, idle: async () => {} },
+    health: new HealthBoard().claim('runtime'), lifetime: lifetime.signal, configured: () => true, closing: () => false } as unknown as PassesHost)
+  lifetime.abort()
+  await passes.pump()
+  expect(kick).not.toHaveBeenCalled()
+  expect(evaluateDue).not.toHaveBeenCalled()
+  expect(() => passes.receive({} as Trigger)).toThrow('Orchestrator is stopping')
+})
+
+it('marks an assignment running once when its launch message reaches the worker', async () => {
+  const started = vi.spyOn(h.runtime.engine, 'assignmentStarted')
+  try {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    await h.runtime.idle()
+    expect(started.mock.calls).toEqual([[one.ticket.id, one.ticket.assignments[0]!.id]])
+  } finally { started.mockRestore() }
+})
+
+it('reports no worker error when a ticket ends before the failure of its retried turn is recorded', async () => {
+  const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+  const ticket = () => h.runtime.store.tickets.get(one.ticket.id)!
+  const report = vi.spyOn(h.runtime.engine, 'report')
+  const gate = deferred()
+  // The message of the retried turn waits for the Session, which then fails.
+  h.controller.resolveAgent.mockImplementation(async (id: string) => {
+    if (id === one.sessionId) { await gate.promise; throw new Error('The Session store is offline') }
+    return h.resolveDefault(id)
+  })
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  try {
+    h.ctx.emit('agent/error', { agent: h.agents.get(one.sessionId), turn: 1, step: 1, error: Object.assign(new Error('Service Unavailable'), { status: 503 }) } as never)
+    await vi.advanceTimersByTimeAsync(15_000)
+    // A person ends the ticket while the retried message is on its way, so recording its failure is refused.
+    await h.runtime.engine.stopTicket(one.ticket.id)
+    gate.resolve()
+    for (let turn = 0; turn < 10; turn++) await Promise.resolve()
+  } finally { vi.useRealTimers() }
+  expect(ticket().ended).toMatchObject({ by: 'human' })
+  // The ticket's end refuses the report; that refusal is an expected race, not a worker health error.
+  expect(report).not.toHaveBeenCalled()
+  expect(h.runtime.health.worker).not.toMatchObject({ state: 'error' })
+  report.mockRestore()
 })

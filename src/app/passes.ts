@@ -25,14 +25,14 @@ export class Passes {
   private pumping?: Promise<void>
   private pumpAgain?: Promise<void>
   constructor(private readonly host: PassesHost) {}
-  start(): void { if (!this.stopped) this.timer = setInterval(() => { this.request() }, 2000) }
+  start(): void { if (!this.stopped && !this.host.lifetime.aborted) this.timer = setInterval(() => { this.request() }, 2000) }
   stop(): Promise<unknown> {
     this.stopped = true
     clearInterval(this.timer)
     return Promise.allSettled([this.pumping, this.pumpAgain])
   }
   receive(trigger: Trigger): ReceiveResult {
-    if (this.host.closing()) throw new Error('Orchestrator is stopping')
+    if (this.host.closing() || this.host.lifetime.aborted) throw new Error('Orchestrator is stopping')
     const result = this.host.engine.receive(trigger)
     if (result === 'stored') this.request()
     return result
@@ -55,14 +55,17 @@ export class Passes {
   /** Run one pass, coalescing concurrent callers into a single follow-up pass. */
   async pump(): Promise<void> {
     // Do not assess, dispatch, or send while waiting for setup; queued work waits for the restart that completes setup.
-    if (!this.host.configured() || this.host.closing()) return
+    // Ending the lifetime (a stop, or a lost state directory lock that stops this process) ends the passes too: no pass writes
+    // to a database another process may own, even before `stop` has finished closing it.
+    if (!this.host.configured() || this.host.closing() || this.host.lifetime.aborted) return
     if (!this.pumping) return this.pumping = this.pumpOnce().finally(() => { this.pumping = undefined })
     const next = () => { this.pumpAgain = undefined; return this.pump() }
     return this.pumpAgain ??= this.pumping.then(next, next)
   }
   private async pumpOnce(): Promise<void> {
+    if (this.host.lifetime.aborted) return
     this.host.effects.kick()
-    if (this.host.closing()) return
+    if (this.host.closing() || this.host.lifetime.aborted) return
     // While processing is paused, the Engine only records the pause on active Evals so they do not expire.
     this.host.engine.evaluateDue()
   }
