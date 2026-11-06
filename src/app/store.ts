@@ -53,7 +53,10 @@ export class Store implements Repositories {
   /**
    * Opens or creates the SQLite database at `path`, migrating schema 10 to schema 11 in a single transaction.
    * @param report - Receives errors thrown by `afterCommit` callbacks without failing the committed transaction.
-   * @throws When the database schema is older than `OLDEST_SCHEMA` (10), newer than `SCHEMA_VERSION` (11), or when migration fails; in every case the database file is left unchanged and the SQLite handle is closed so a later attempt in the same process can open it.
+   * @throws When the database schema is older than `OLDEST_SCHEMA` (10), newer than `SCHEMA_VERSION` (11), or when migration fails.
+   * A refused database keeps its schema and records, apart from the empty `kv` table the version is read from (created before
+   * validation, since it holds that version) and the owner-only mode the file is given; the SQLite handle is closed in every
+   * case so a later attempt in the same process can open it.
    */
   constructor(path: string, private readonly report: (error: unknown) => void = () => {}) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 })
@@ -61,11 +64,13 @@ export class Store implements Repositories {
     this.read = storeReads(this.db)
     try {
       chmodSync(path, 0o600)
-      this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
+      // The version is read from the key-value table, so that empty table comes before the validation; nothing else is written.
+      this.db.exec('CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL)')
       const version = this.get(KV.store.schema)
       if (version !== undefined && version > SCHEMA_VERSION) throw new Error(`Unsupported orchestrator database version ${version}`)
       if (version !== undefined && version < OLDEST_SCHEMA) throw new Error(tooOld(version))
       const migrating = version !== undefined && version < SCHEMA_VERSION
+      this.db.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL')
       try {
         this.atomic(() => {
           this.db.exec(`
@@ -138,14 +143,17 @@ export class Store implements Repositories {
    * Post-commit callbacks run only after the outermost transaction commits, and callback errors are reported without failing the committed transaction.
    */
   atomic<T>(operation: () => T): T {
-    const level = this.depth++
+    const level = this.depth
     const name = `orchestrator_atomic_${level}`
-    this.committed[level] = []
+    // The savepoint opens before the nested level is taken: a SAVEPOINT that fails leaves no transaction open, so the depth
+    // must stay as it was. Otherwise every later `afterCommit` at this level is lost, and with it its side effects, for good.
     this.db.exec(`SAVEPOINT ${name}`)
+    this.depth = level + 1
+    this.committed[level] = []
     let value: T
     try { value = operation(); this.db.exec(`RELEASE ${name}`) }
     catch (error) { this.db.exec(`ROLLBACK TO ${name}`); this.db.exec(`RELEASE ${name}`); throw error }
-    finally { this.depth-- }
+    finally { this.depth = level }
     const actions = this.committed.splice(level)[0]!
     if (level) this.committed[level - 1]!.push(...actions)
     else for (const action of actions) { try { action() } catch (error) { this.report(error) } }

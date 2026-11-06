@@ -201,6 +201,49 @@ it('reports a failure of the queue itself under its kind, until a dispatch of th
   expect(health.relay).toMatchObject({ state: 'ready', detail: 'Nothing waiting' })
 })
 
+it('shows from when an effect queued again with a new payload waits, not from when it was first queued', async () => {
+  effects.handle('notice', async () => { throw new Error('offline') }, { retry: [1000, 1000] })
+  effects.enqueue('notice', 'prompts', { value: { prompt_config_saved: 1 }, summary: 'Prompt configuration saved' })
+  await effects.idle()
+  expect(health.notice).toMatchObject({ state: 'ready', detail: `1 waiting since ${new Date(clock).toISOString()}` })
+  // A payload that replaces the waiting one starts its own wait, which the detail names.
+  clock += 60_000
+  effects.enqueue('notice', 'prompts', { value: { prompt_config_saved: 2 }, summary: 'Prompt configuration saved' })
+  await effects.idle()
+  expect(health.notice).toMatchObject({ state: 'ready', detail: `1 waiting since ${new Date(clock).toISOString()}` })
+})
+
+it('names the failure that happened last, not the error of the row with the highest sequence', async () => {
+  const delayed = new Set<string>()
+  effects.handle('notice', async (_payload: { value: unknown; summary: string }, key: string) => {
+    if (delayed.has(key)) throw new Later('The Session is busy')
+    throw new Error(`failure of ${key}`)
+  }, { retry: [1000, 1000] })
+  effects.enqueue('notice', 'first', { value: {}, summary: 'first' })
+  effects.enqueue('notice', 'second', { value: {}, summary: 'second' })
+  for (let round = 0; round < 3; round++) { await effects.idle(); clock += 1000 }
+  expect(health.notice).toMatchObject({ state: 'error', detail: expect.stringContaining('the last failure: Error: failure of second') })
+  // `second` only delays its next attempt while `first` fails again: the queue's newest failure is `first`'s, though `second` has the higher sequence.
+  delayed.add('second')
+  await effects.idle()
+  expect(health.notice).toMatchObject({ state: 'error', detail: expect.stringContaining('the last failure: Error: failure of first') })
+})
+
+it('starts no effect once its lifetime ended, even before the queue drains', async () => {
+  const lifetime = new AbortController()
+  const guarded = new Effects(store, new HealthBoard(), () => clock, lifetime.signal)
+  const run = vi.fn(async () => {})
+  guarded.handle('relay', run)
+  guarded.start()
+  guarded.enqueue('relay', 'k', relay('a'))
+  lifetime.abort()
+  await Promise.resolve(); await Promise.resolve()
+  expect(run).not.toHaveBeenCalled()
+  expect(guarded.pending('relay', 'k')).toBe(true)
+  guarded.kick(); await Promise.resolve()
+  expect(run).not.toHaveBeenCalled()
+})
+
 it('refuses a second handler for a kind', () => {
   effects.handle('relay', async () => {})
   expect(() => effects.handle('relay', async () => {})).toThrow('The relay effects already have a handler')

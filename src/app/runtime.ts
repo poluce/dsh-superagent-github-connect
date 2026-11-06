@@ -89,7 +89,15 @@ export class Runtime extends Service implements SourceHost {
     const runtime = this
     // Lock the state directory before opening the database so another process cannot migrate or write concurrently.
     mkdirSync(machine.stateDir, { recursive: true, mode: 0o700 })
-    const compromised = (error: Error) => { this.runtimeHealth.set({ state: 'error', detail: error.message }); this.stopped.abort() }
+    // Another process may have taken the state directory, and this one must then write nothing more, so stop for real here:
+    // `shutdown` sets the closing flag first and stops the passes, the effects, and the workers before it closes the database.
+    // Reporting the loss of the lock and returning would leave SQLite open and this process writing beside the new owner.
+    const compromised = (error: Error) => {
+      try {
+        this.runtimeHealth.set({ state: 'error', detail: error.message, at: now() })
+        void this.stop().catch((failure: unknown) => { ctx.logger.warn('dsh-superagent could not stop after losing its state directory lock: %s', String(failure)) })
+      } catch (failure) { ctx.logger.warn('dsh-superagent lost its state directory lock: %s', String(failure)) }
+    }
     const release = lockSync(machine.stateDir, { stale: 30_000, onCompromised: compromised })
     this.releaseLock = async () => { release() }
     let opened: Store | undefined
@@ -105,7 +113,7 @@ export class Runtime extends Service implements SourceHost {
       store.set(KV.runtime.masterId, masterId)
       const commands = this.commands = new Commands(() => setup.deployment, setup.commandEnvironment, this.lifetime)
       const board = this.board
-      const effects = this.effects = new Effects(store, board)
+      const effects = this.effects = new Effects(store, board, undefined, this.stopped.signal)
       const sources = this.sources = new SourceRegistry(() => store.settings(), board, kind => {
         // Sync source member lists once startup completes when a source plugin loads dynamically.
         if (kind.policy?.sync) void this.ready?.then(() => this.settings.syncable().includes(kind.kind) ? this.settings.sync(kind.kind) : undefined)
