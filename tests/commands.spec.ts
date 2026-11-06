@@ -14,7 +14,7 @@ import { key, type OutboundMessage } from '../src/core/index.ts'
 import { testDeployment } from './fixtures/deployment.ts'
 const sources = new SourceRegistry(() => SettingsSchema.parse({}))
 sources.register(feishuKind); sources.register(githubKind)
-const send = (commands: Commands, message: OutboundMessage) => sources.send(message, commands)
+const send = (commands: Commands, message: OutboundMessage, idempotencyKey?: string) => sources.send(message, commands, idempotencyKey)
 const deployment = testDeployment({ github: { ...testDeployment().github, cli: '/path/agent-gh' } })
 const REPOSITORY = deployment.repository
 const reply = { id: 'stable-operation', channel: githubChannel(8), text: 'Done', kind: 'reply' as const }
@@ -61,6 +61,18 @@ describe('account-isolated operations', () => {
     const commands = new Commands(() => deployment, {}, new AbortController().signal); const run = vi.spyOn(commands,'run').mockResolvedValue('{"ok":true,"data":{}}')
     await send(commands, { ...reply, channel: feishuChannel('oc_1', 'om_1') })
     expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--as','bot','--idempotency-key','stable-operation','--message-id','om_1']))
+  })
+  it('sends by the idempotency key the caller passes, not by the message\'s own id', async () => {
+    // The Outbox passes the receipt's id on every attempt of one message, so its Channel must deduplicate by that key.
+    const github = new Commands(() => deployment, {}, new AbortController().signal)
+    vi.spyOn(github,'pages').mockResolvedValue([])
+    const gh = vi.spyOn(github,'gh').mockResolvedValue({})
+    expect(await send(github, reply, 'retry-key')).toBe('sent')
+    expect(gh).toHaveBeenCalledWith(['api',`repos/${REPOSITORY}/issues/8/comments`,'--method','POST','-f','body=Done\n\n<!-- dsh-superagent:retry-key -->'])
+    const feishu = new Commands(() => deployment, {}, new AbortController().signal)
+    const run = vi.spyOn(feishu,'run').mockResolvedValue('{"ok":true,"data":{}}')
+    await send(feishu, { ...reply, channel: feishuChannel('oc_1', 'om_1') }, 'retry-key')
+    expect(run.mock.calls[0]![1]).toEqual(expect.arrayContaining(['--as','bot','--idempotency-key','retry-key','--message-id','om_1']))
   })
 })
 

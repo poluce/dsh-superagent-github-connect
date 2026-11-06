@@ -15,7 +15,7 @@ const gone = (error: unknown): boolean => error instanceof CliError
   && (error.code === 410 || (error.code === 403 && /locked/i.test(error.message)))
 const missing = (error: unknown): boolean => error instanceof CliError && (error.code === 404 || error.code === 410)
 /** Posts a comment or review-thread reply with an embedded HTML marker so retries do not create duplicate comments. */
-export async function sendGithub(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
+export async function sendGithub(host: Pick<SourceContext, 'commands'>, message: OutboundMessage, idempotencyKey: string): Promise<'sent' | 'gone'> {
   const { commands } = host
   const { repository, github } = commands.deployment
   const number = Number(message.channel.address.number)
@@ -31,7 +31,8 @@ export async function sendGithub(host: Pick<SourceContext, 'commands'>, message:
       rootId = source ? source.in_reply_to_id ?? source.id : undefined
     }
     const path = rootId === undefined ? `issues/${number}/comments` : `pulls/${number}/comments`
-    const marker = `<!-- dsh-superagent:${message.id} -->`
+    // The marker carries the idempotency key the Outbox gave this attempt, the same one a retry passes.
+    const marker = `<!-- dsh-superagent:${idempotencyKey} -->`
     const mine = (comment: z.infer<typeof CommentSchema>) => sameName(comment.user?.login ?? '', github.login)
       && (rootId === undefined || comment.in_reply_to_id === rootId) && (comment.body ?? '').includes(marker)
     if ((await commands.pages(CommentSchema, path)).some(mine)) return 'sent'

@@ -98,10 +98,16 @@ export interface SourceChannel<C> {
   /** Whether a reply may still go to `address`; without it, every address may receive replies. */
   allowed?(address: Record<string, string>, config: C): boolean
   /**
-   * Sends a message idempotently by ID; returns `'gone'` when the target conversation no longer accepts replies.
+   * Sends a message at most once for `idempotencyKey`, and returns `'gone'` when the target conversation no longer accepts
+   * replies.
+   *
+   * Delivery is at-least-once: the Outbox removes a message only after this call returned `'sent'`, so a process that
+   * stopped between that answer and the removal sends the same message again on its next start, under the same key (the
+   * outbound message's id). A Channel therefore has to deduplicate by the key it is given rather than by the text it sees:
+   * GitHub embeds it in an HTML marker in the comment body, Feishu passes it as the reply's idempotency key.
    * @throws when delivery failed but may succeed on a later retry.
    */
-  send(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'>
+  send(host: Pick<SourceContext, 'commands'>, message: OutboundMessage, idempotencyKey: string): Promise<'sent' | 'gone'>
   /** Returns the URL and label for `address`; `url` is empty when `links` lack the required deployment info. */
   link(address: Record<string, string>, links: ChannelLinks): ChannelLink
 }

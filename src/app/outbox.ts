@@ -17,6 +17,8 @@ export interface OutboxHost {
 /**
  * Persists outbound channel messages as receipts and delivers them sequentially through `Effects` and `SourceRegistry`.
  * Implements the core `Outbox` port for `Engine` and source contexts, ensuring per-conversation ordering for each ticket until an earlier message fails repeatedly.
+ * Delivery is at-least-once: a receipt stays pending until its Channel confirmed the message, so one a stopped process left
+ * behind is sent again after the restart under the same idempotency key (`message.id`), which the Channel deduplicates.
  * Messages wait while processing is paused or their source is unavailable, and settle as dropped when the target conversation is ignored or gone.
  */
 export class Outbox implements OutboxPort {
@@ -45,7 +47,9 @@ export class Outbox implements OutboxPort {
     if (store.receipts.behind(id, FAILURES_BEFORE_ERROR)) throw new Later('An earlier message of this ticket to this conversation waits')
     if (!sources.channelAllowed(receipt.channel)) { store.receipts.settle(receipt, 'channelIgnored'); return }
     // A permanently unreachable target (such as a recalled message or deleted Issue) settles as `channelGone` so its receipt prevents retries.
-    const result = await sources.send(receipt, commands)
+    // The idempotency key is the receipt's own id, kept in the database: a send that succeeded but whose receipt this process did
+    // not record is repeated with that same key, which the Channel uses to keep one message in the conversation.
+    const result = await sources.send(receipt, commands, receipt.id)
     if (result === 'waiting') throw new Later('The Source is not installed')
     store.receipts.settle(receipt, result === 'gone' ? 'channelGone' : 'sent')
   }
