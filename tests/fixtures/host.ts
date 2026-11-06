@@ -20,6 +20,10 @@ import { testMachine } from './deployment.ts'
 
 export const MEMBER = 'ou_alice'
 export const CHAT = 'oc_team'
+/** The shell a prepare command runs in, as the Executor chooses it: PowerShell 7 on Windows, `sh` elsewhere. */
+export const prepareShell: readonly string[] = process.platform === 'win32' ? ['pwsh', '-NoProfile', '-Command'] : ['sh', '-c']
+/** The argv a prepare command spawns with, which a spawn mock's `answers` are keyed by when joined with spaces. */
+export const prepareArgv = (command: string): string[] => [...prepareShell, command]
 
 /** Build a Feishu mention trigger from Alice in `oc_team`, using the digits in `id` as the timestamp offset in seconds. */
 export function feishu(id: string, text: string, overrides: Record<string, unknown> = {}): Trigger {
@@ -150,14 +154,14 @@ export async function startRuntime(seed?: (store: Store) => void) {
     ['git config -z --show-origin --get-all credential.https://github.com.helper']: `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT)}\0`,
     [scoped]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
   }
-  /** A prepare command (`sh -c`) waits for this while it is set. */
+  /** A prepare command (the platform's shell) waits for this while it is set. */
   const hooks: { prepare?: Promise<void> } = {}
   const subprocess = { spawn: vi.fn((spec: { argv: readonly string[] }) => {
     const argv = [...spec.argv]
     while (argv[0] === 'env' || /^[A-Z_]+=/.test(argv[0] ?? '')) argv.shift()
     const reader = (text: string) => ({ readFrom: () => ({ text, nextOffset: text.length, lossy: false }) })
     const exited = { exitCode: 0, signal: null }
-    const done = argv[0] === 'sh' && hooks.prepare ? hooks.prepare.then(() => exited) : Promise.resolve(exited)
+    const done = argv[0] === prepareShell[0] && hooks.prepare ? hooks.prepare.then(() => exited) : Promise.resolve(exited)
     return { done, collected: { stdout: reader(answers[argv.join(' ')] ?? ''), stderr: reader('') } }
   }) }
   const agents = new Map<string, FakeAgent>()
