@@ -1,10 +1,15 @@
 import { expect, it } from 'vitest'
 import type { EffectKind } from '../src/app/effects.ts'
-import { en, zh, type DshSuperagentKey } from '../src/client/locales.ts'
+import { en, GLOSSARY, GLOSSARY_VALUES, zh, type DshSuperagentKey } from '../src/client/locales.ts'
 import { reasonLabel, type T } from '../src/client/text.ts'
 import { REASONS, USER_ERRORS } from '../src/core/index.ts'
+import { HEALTH_TEXT, type HealthCode } from '../src/sources/host.ts'
+import { SETUP_PROBLEMS, type SetupCode } from '../src/setup.ts'
 
 const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map(match => match[1]).sort()
+/** The words a dictionary has for `key`, or undefined when it has none; the key is built at run time, so it is looked up untyped. */
+const words = (dictionary: Record<DshSuperagentKey, string>, key: string): string | undefined =>
+  (dictionary as Record<string, string>)[key]
 
 it('names the same placeholders in both languages', () => {
   const keys = Object.keys(zh) as DshSuperagentKey[]
@@ -43,4 +48,28 @@ it('has words for every reason code the core records', () => {
 
 it('words the reasons agents read in the glossary\'s words: a sender on the list, a Thread', () => {
   expect(Object.values(REASONS).filter(text => /\b(member|members|topic)\b/i.test(text))).toEqual([])
+})
+
+it('words every health code and setup problem the host reports, in both languages and in the host\'s own words', () => {
+  const healthCodes = Object.keys(HEALTH_TEXT) as HealthCode[]
+  expect(healthCodes.filter(code => words(zh, `healthCode.${code}`) === undefined)).toEqual([])
+  expect(healthCodes.filter(code => words(en, `healthCode.${code}`) === undefined)).toEqual([])
+  // English reuses the host's own text, which the log and the main Session read, so the panel and the log cannot drift apart.
+  expect(healthCodes.filter(code => words(en, `healthCode.${code}`) !== HEALTH_TEXT[code])).toEqual([])
+  // No stale keys either: a key the host can never report is text nobody reads.
+  expect(Object.keys(zh).filter(key => key.startsWith('healthCode.')).map(key => key.slice('healthCode.'.length))
+    .filter(code => !(code in HEALTH_TEXT))).toEqual([])
+  const setupCodes = Object.keys(SETUP_PROBLEMS) as SetupCode[]
+  expect(setupCodes.filter(code => words(zh, `setup.${code}`) === undefined)).toEqual([])
+  expect(setupCodes.filter(code => words(en, `setup.${code}`) !== SETUP_PROBLEMS[code][1])).toEqual([])
+  expect(Object.keys(zh).filter(key => key.startsWith('setup.')).map(key => key.slice('setup.'.length))
+    .filter(code => !(code in SETUP_PROBLEMS))).toEqual([])
+})
+
+it('names every glossary term, and every value the glossary lists, in both languages', () => {
+  const terms = Object.values(GLOSSARY).flat()
+  expect(terms.filter(term => words(zh, `term.${term}`) === undefined || words(zh, `meaning.${term}`) === undefined)).toEqual([])
+  expect(terms.filter(term => words(en, `term.${term}`) === undefined || words(en, `meaning.${term}`) === undefined)).toEqual([])
+  const values = Object.values(GLOSSARY_VALUES).flat()
+  expect(values.filter(key => words(zh, key) === undefined || words(en, key) === undefined)).toEqual([])
 })

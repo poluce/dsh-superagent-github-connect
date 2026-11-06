@@ -127,6 +127,7 @@ export function pollFailure(failures: number, threshold: number, error: unknown)
 async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   let interval = 60
   let failures = 0
+  let backoff = 0
   await ctx.ready
   // Setup restarts dsh-superagent once it resolves the accounts; until then nothing is polled.
   if (!ctx.configured()) { ctx.report('github', health('paused', 'setupPending')); return }
@@ -134,34 +135,71 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     const config = ctx.config<GithubConfig>(SOURCE)
     try {
       if (config) interval = await pollRound(ctx, signal)
-      else ctx.report('github', health('paused', 'sourceOff'))
+      else { ctx.report('github', health('paused', 'sourceOff')); interval = 60 }
       failures = 0
+      backoff = 0
     } catch (error) {
       failures += 1
+      // A rate-limited round backs off exponentially instead of polling again sooner into the same limit.
+      backoff = limitBackoff(backoff, error)
       const failed = pollFailure(failures, config?.failuresBeforeError ?? 1, error)
       if (!signal.aborted && failed) ctx.report('github', failed)
     }
-    await pause(Math.max(interval, ctx.config<GithubConfig>(SOURCE)?.pollSeconds ?? 60) * 1000, signal)
+    await pause(Math.max(interval, ctx.config<GithubConfig>(SOURCE)?.pollSeconds ?? 60, backoff) * 1000, signal)
   }
 }
 interface Round {
-  started: string; signal?: AbortSignal | undefined
+  started: string; signal?: AbortSignal | undefined; interval: number
   pulls: Map<number, Promise<Pull>>; read: Set<number>; failures: string[]; dropped: number[]; abandoned: number[]
   tally: Tally
 }
-const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, pulls: new Map(), read: new Set(),
-  failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
+const newRound = (signal?: AbortSignal): Round => ({ started: new Date().toISOString(), signal, interval: 0, pulls: new Map(),
+  read: new Set(), failures: [], dropped: [], abandoned: [], tally: { skipped: 0 } })
 const stopped = (ctx: SourceContext, round: Round): boolean => !!round.signal?.aborted || !ctx.config(SOURCE)
 export interface Retry { since: string; pr: boolean; failedAt?: string; attempts?: number }
 const RETRY_WINDOW_MS = 24 * 3600_000
+/** Longest wait between polling rounds, in seconds; also the cap of the backoff after GitHub rate limits a round. */
+const MAX_POLL_SECONDS = 3600
+/**
+ * True when GitHub refused the request for rate limiting: its hourly limit (403 or 429) or a secondary limit (also 403).
+ * A round that aggregated its steps' failures reports them as a plain Error naming the HTTP status, which counts too.
+ */
+const rateLimited = (error: unknown): boolean => error instanceof CliError
+  ? error.code === 403 || error.code === 429 || /rate limit|abuse/i.test(error.message)
+  : /rate limit|abuse|HTTP 403|HTTP 429/i.test(String(error))
+/**
+ * Seconds GitHub asks the Source to wait, read from `Retry-After` (seconds or an HTTP date) or, once the hourly quota is
+ * spent (`x-ratelimit-remaining: 0`), from when `x-ratelimit-reset` says the quota returns. Returns undefined when the
+ * response asks for no wait.
+ */
+export function rateLimitSeconds(headers: string, now = Date.now()): number | undefined {
+  const retryAfter = /^retry-after:\s*(.+)$/im.exec(headers)?.[1]?.trim()
+  const asked = retryAfter === undefined ? undefined : /^\d+$/.test(retryAfter)
+    ? Number(retryAfter) : Math.ceil((Date.parse(retryAfter) - now) / 1000)
+  const remaining = /^x-ratelimit-remaining:\s*(\d+)/im.exec(headers)?.[1]
+  const reset = Number(/^x-ratelimit-reset:\s*(\d+)/im.exec(headers)?.[1] ?? Number.NaN)
+  // `x-ratelimit-reset` is an epoch second, while `now` is epoch milliseconds.
+  const untilReset = remaining === '0' && Number.isFinite(reset) ? Math.ceil(reset - now / 1000) : undefined
+  const waits = [Number.isFinite(asked) ? asked : undefined, untilReset]
+    .filter((wait): wait is number => wait !== undefined && wait > 0)
+  return waits.length ? Math.min(Math.max(...waits), MAX_POLL_SECONDS) : undefined
+}
+/** Wait in seconds before the next round after a rate-limited one: one minute, doubling per consecutive limit up to an hour; 0 for any other failure. */
+export function limitBackoff(previous: number, error: unknown): number {
+  return rateLimited(error) ? Math.min(previous >= 60 ? previous * 2 : 60, MAX_POLL_SECONDS) : 0
+}
 /** True when GitHub returns HTTP 410 (Gone); HTTP 404 is retried because it can indicate revoked access to a private repository. */
 const deleted = (error: unknown): boolean => error instanceof CliError && error.code === 410
-/** Records a failed read on the Thread and in the round; deleted (410) or abandoned (24h+) threads do not fail the round. */
+/**
+ * Records a failed read on the Thread and in the round; deleted (410) or abandoned (24h+) threads do not fail the round.
+ * A deleted Issue or PR is a terminal state rather than a failed read, so it leaves (or clears) no poll error on its Thread;
+ * the round's health detail names it, and a stale error from an earlier retry is removed.
+ */
 function failed(ctx: SourceContext, round: Round, number: number, error: unknown, abandoned = false): void {
   if (deleted(error)) round.dropped.push(number)
   else if (abandoned) round.abandoned.push(number)
   else round.failures.push(`#${number}: ${String(error)}`)
-  ctx.threads.patch(`github:${number}`, { pollError: String(error) })
+  ctx.threads.patch(`github:${number}`, { pollError: deleted(error) ? undefined : String(error) })
 }
 function included(raw: string): { headers: string; body: string } {
   const split = raw.search(/\r?\n\r?\n/)
@@ -217,6 +255,8 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
     throw error
   }
   const { headers, body } = included(raw)
+  // A list GitHub answers while it wants the caller to slow down pushes the whole round back, not only this stream.
+  round.interval = Math.max(round.interval, rateLimitSeconds(headers) ?? 0)
   const items = validItems(ListedSchema, z.array(z.unknown()).parse(JSON.parse(body)), round.tally)
   const { login } = ctx.deployment.github
   const fresh = (at: string | null | undefined, kind: string) =>
@@ -284,18 +324,19 @@ export async function pollRound(ctx: SourceContext, signal?: AbortSignal): Promi
   await pollTicketPulls(ctx, signal, round)
   await pollThreads(ctx, signal, round)
   if ('error' in notified) throw notified.error
-  const { count, interval } = notified.value
-  if (signal?.aborted) return interval
+  const { count, interval, unreadable } = notified.value
+  if (signal?.aborted) return Math.max(interval, round.interval)
   if (round.failures.length) throw new Error(`${round.failures.length} GitHub reads failed: ${round.failures.slice(0, 3).join('; ')}`)
   const named = (numbers: number[]) => [...new Set(numbers)].sort((a, b) => a - b).map(number => `#${number}`).join(', ')
   const dropped = (round.dropped.length ? `; deleted on GitHub: ${named(round.dropped)}` : '')
     + (round.abandoned.length ? `; dropped after their reads kept failing: ${named(round.abandoned)}` : '')
     + (round.tally.skipped ? `; ${round.tally.skipped} unreadable items skipped` : '')
-  ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${interval}s${dropped}`, at: round.started })
-  return interval
+    + (unreadable ? `; ${unreadable} notifications of threads this Source does not read` : '')
+  ctx.report('github', { state: 'ready', detail: `${count} notifications; next poll ≥ ${Math.max(interval, round.interval)}s${dropped}`, at: round.started })
+  return Math.max(interval, round.interval)
 }
-/** Reads notifications since the cursor and each Issue or PR they name, advancing the cursor atomically with the retry map for failed reads; deleted (410) Issues are dropped once their error is recorded. */
-async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ count: number; interval: number }> {
+/** Reads notifications since the cursor and each Issue or PR they name, advancing the cursor atomically with the retry map for failed reads; deleted (410) Issues are dropped and named in the round's health. */
+async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ count: number; interval: number; unreadable: number }> {
   const { state } = ctx
   const commands = ctx.commands.withSignal(round.signal)
   const since = state.get(KV.github.since) ?? round.started
@@ -308,28 +349,35 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
   const headers = raw.slice(0, split)
   const body = raw.slice(split).trim()
   const asked = Number(/x-poll-interval:\s*(\d+)/i.exec(headers)?.[1] ?? 60)
-  const interval = Math.max(60, Number.isFinite(asked) ? asked : 60)
+  // GitHub's polling interval and a rate-limit wait both push the next round back; the longer one wins.
+  const interval = Math.max(60, Number.isFinite(asked) ? asked : 60, rateLimitSeconds(headers) ?? 0)
   const notifications = /rel="next"/.test(headers)
     ? await commands.pages(NotificationSchema, path, round.tally)
     : validItems(NotificationSchema, z.array(z.unknown()).parse(JSON.parse(body)), round.tally)
   const retries = { ...state.get(KV.github.retries) }
+  let unreadable = 0
   // Failed items from the previous round run first, followed by newly notified items in chronological order; each is read once.
   const items = new Map(Object.entries(retries).map(([number, retry]) => [Number(number), retry]))
   for (const notification of notifications.reverse()) {
     if (!sameName(notification.repository.full_name, repository)) continue
-    const address = githubAddress(notification.subject.url ?? '', repository)
-    if (!address || address.discussion || items.has(address.number)) continue
+    const url = notification.subject.url ?? ''
+    if (!url) continue
+    const address = githubAddress(url, repository)
+    // GitHub names some threads (commits, releases, review comment threads) by addresses this Source cannot read an Issue
+    // or PR from; they are counted and named in the health detail instead of being dropped silently.
+    if (!address || address.discussion) { unreadable += 1; continue }
+    if (items.has(address.number)) continue
     const { number, pr } = address
     items.set(number, { since: [state.get(KV.github.cursor(number)) ?? since, since].sort().at(-1)!, pr })
   }
   for (const [number, item] of items) {
-    if (stopped(ctx, round)) return { count: notifications.length, interval }
+    if (stopped(ctx, round)) return { count: notifications.length, interval, unreadable }
     round.read.add(number)
     try {
       await readNotified(ctx, round, number, item)
       delete retries[number]
     } catch (error) {
-      if (stopped(ctx, round)) return { count: notifications.length, interval }
+      if (stopped(ctx, round)) return { count: notifications.length, interval, unreadable }
       const retry = { ...item, failedAt: item.failedAt ?? round.started, attempts: (item.attempts ?? 0) + 1 }
       // Abandon notification retries after 24 hours of failures so a permanently unreadable thread does not hold source health in error; its cursor stays so a later notification or thread poll still reads what was missed.
       const abandoned = Date.parse(round.started) - Date.parse(retry.failedAt) >= RETRY_WINDOW_MS
@@ -339,7 +387,7 @@ async function pollNotifications(ctx: SourceContext, round: Round): Promise<{ co
     }
   }
   ctx.atomic(() => { state.set(KV.github.since, cursorAt(round.started)); state.set(KV.github.retries, retries) })
-  return { count: notifications.length, interval }
+  return { count: notifications.length, interval, unreadable }
 }
 async function readNotified(ctx: SourceContext, round: Round, number: number, item: Retry): Promise<void> {
   const { since } = item
@@ -426,13 +474,19 @@ function nameThread(ctx: SourceContext, number: number, title: string): void {
   ctx.threads.patch(`github:${number}`, { title })
   ctx.threads.describe(`github:${number}`, { label: `#${number} ${title}`, facts: { number: { value: `#${number}` } } })
 }
-/** Polls subscribed Issue and PR Threads not already read in this round; a deleted (410) Issue is still polled within the horizon (costing one read) and does not fail the round. */
+/**
+ * Polls subscribed Issue and PR Threads not already read in this round. A deleted (410) Issue is still polled within the
+ * horizon (costing one read) and does not fail the round: it is named in the round's health detail, and because it is a
+ * terminal state rather than a failed read it leaves no poll error on its Thread (clearing one an earlier retry wrote).
+ */
 export async function pollThreads(ctx: SourceContext, signal?: AbortSignal, round = newRound(signal)): Promise<void> {
   await pollEach(ctx, SOURCE, () => stopped(ctx, round), async thread => {
     try { await pollThread(ctx, round, thread) }
     catch (error) {
       if (stopped(ctx, round)) throw error
-      if (deleted(error)) round.dropped.push(Number(thread.ref.id)); else round.failures.push(`${thread.key}: ${String(error)}`)
+      // Returning rather than throwing lets the shared poller treat the Thread as read, which clears any poll error on it.
+      if (deleted(error)) { round.dropped.push(Number(thread.ref.id)); return }
+      round.failures.push(`${thread.key}: ${String(error)}`)
       throw error
     }
   }, thread => round.read.has(Number(thread.ref.id)))
