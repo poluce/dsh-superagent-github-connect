@@ -10,7 +10,7 @@ It is also a way of working with an agent: **take as little human attention as p
 
 ## Platforms
 
-dsh-superagent runs on Linux and macOS. Windows support covers setup, the worker environment and prepare commands; the `scripts/dsh-superagent` service script, tmux and the hourly check that uses them are still POSIX-only, and a Node-based service script that replaces tmux is planned. [006 Deployment](docs/006-deployment.md) lists the Windows differences: `.cmd` worker shims, `PATHEXT` command resolution and `pwsh` prepare commands, and NTFS ACLs instead of POSIX file modes.
+dsh-superagent runs on Linux, macOS and Windows. On Linux and macOS the service script hosts the process in a tmux session and stops it with a signal; on Windows it starts a hidden, detached process and stops it with `taskkill /T /F`. [006 Deployment](docs/006-deployment.md) lists the Windows differences: `.cmd` worker shims, `PATHEXT` command resolution, `pwsh` prepare commands, and NTFS ACLs instead of POSIX file modes.
 
 ## Setup
 

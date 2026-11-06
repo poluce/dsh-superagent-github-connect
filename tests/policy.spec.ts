@@ -269,6 +269,13 @@ it('renames the variables a stored prepare command reads from earlier project na
   expect(settings.executor.prepare).toBe('git worktree add "$DSH_SUPERAGENT_DIR" -b "agent/${DSH_SUPERAGENT_NAME}" "refs/x/$DSH_SUPERAGENT_TICKET"')
 })
 
+it('accepts the absolute ticket directory root of the platform, and refuses a relative one', () => {
+  // The root is a path on the machine that runs the deployment, so its form follows the platform: a POSIX path or a Windows drive or UNC path.
+  const absolute = process.platform === 'win32' ? 'C:\\agent\\work' : '/srv/agent/work'
+  expect(SettingsSchema.parse({ executor: { directory: absolute } }).executor.directory).toBe(absolute)
+  expect(() => SettingsSchema.parse({ executor: { directory: 'agent/work' } })).toThrow()
+})
+
 it('reads a stored GitHub Source configuration that names a merge account without it', () => {
   const settings = SettingsSchema.parse(migrateSettings({ sources: { github: { enabled: true, config: { repository: 'acme/widgets', cli: 'gh-agent', mergeCli: 'gh-merge-account', pollSeconds: 120 } } } }))
   expect(settings.sources.github!.config).toEqual({ repository: 'acme/widgets', cli: 'gh-agent', pollSeconds: 120 })

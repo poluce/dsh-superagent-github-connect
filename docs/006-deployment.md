@@ -20,7 +20,7 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
 ## Prerequisites
 
-- Node.js 22.19+ or 24+, pnpm, git 2.32+, Python 3.8+ and tmux
+- Node.js 22.19+ or 24+, pnpm and git 2.32+; `tmux` on Linux or macOS, where the service script hosts the process, and PowerShell 7 (`pwsh`) on Windows for prepare commands
 - GitHub CLI (`gh`) 2.48 or later. Source CLI fields must point to `gh` or `lark-cli` wrappers; the host relies on their subcommands and output formats.
 - A repository on github.com; GitHub Enterprise Server is not supported. To create a checkout per Ticket, keep a local clone from which the prepare command can add worktrees. Install `git-lfs` if that repository uses Git LFS.
 - A model provider configured for DeepSeek Harness. dsh-superagent uses the profile's default model unless the Eval or Execution settings name another.
@@ -28,9 +28,9 @@ Both presets run with `danger-full-access` as the operator's OS user and read me
 
 ### Windows
 
-Windows is supported for setup, the worker environment and the prepare command. The `scripts/dsh-superagent` service script, tmux, and the hourly check that uses them are still POSIX-only; a Node-based service script that replaces tmux is planned. On Windows:
+Windows is supported end to end: setup, the worker environment, prepare commands and the service script, which is written in Node. On Windows the script starts the service as a hidden, detached process instead of a tmux session and stops it with `taskkill /T /F`; a stop therefore cannot ask a running Executor step to finish first, as it does on POSIX. On Windows:
 
-- **Prerequisites** are the same except tmux and Python: Node.js 22.19+ or 24+, pnpm, git 2.32+, GitHub CLI 2.48+, and PowerShell 7 (`pwsh`) for prepare commands.
+- **Prerequisites** are the same except tmux: Node.js 22.19+ or 24+, pnpm, git 2.32+, GitHub CLI 2.48+, PowerShell 7 (`pwsh`) for prepare commands, and the `Get-CimInstance` and `taskkill` commands that ship with Windows.
 - **Command shims are `.cmd` files.** `worker-bin` holds `gh.cmd`, `lark-cli.cmd` and one `<command>.cmd` per blocked command. Windows starts a process only from an executable image or a `.bat`/`.cmd` script and ignores an extensionless script, so a POSIX `#!/bin/sh` shim would silently do nothing and a worker's `gh` would run as the operator's own account instead of the agent's. dsh-superagent rewrites these files on every start; do not edit or replace them.
 - **Account CLIs** must be `.exe`, `.cmd` or `.bat` files on `PATH` or absolute paths. The host resolves a command name through `PATHEXT`, so a configured `gh` resolves to `gh.exe`, and it runs a `.cmd` CLI through `cmd.exe`.
 - **The credential helper** in the isolated git configuration is `!'C:\…' auth git-credential`; Git for Windows' `sh` parses it with paths that hold spaces and backslashes (checked with git 2.50).
@@ -133,9 +133,16 @@ scripts/dsh-superagent start
 scripts/dsh-superagent status
 ```
 
+On Windows, call the same script through Node, because `cmd` and PowerShell do not start an extensionless script:
+
+```powershell
+node scripts/dsh-superagent start
+node scripts/dsh-superagent status
+```
+
 `start` runs `dsh --profile superagent` in tmux session `dsh-superagent`, or `dsh-<profile>` for another profile. It waits up to one minute for the runtime to become ready or report a setup requirement. On a first run it prints the missing setup information. It refuses duplicate instances, including ones started outside this script.
 
-On Windows the service script and tmux are not available yet: run `dsh --profile superagent` in a terminal, or under a Windows service wrapper that restarts it, and read the setup problems from its log and the panel. The hourly check below needs `scripts/dsh-superagent`, so on Windows watch the panel instead until the Node-based service script replaces it.
+On Windows it runs `dsh --profile superagent` in a hidden, detached process, finds it again through `Get-CimInstance`, and records its process id. A stop there kills the process tree with `taskkill /T /F`, which interrupts a running Executor step instead of waiting for it; `--stop-timeout` then bounds the wait for the process to disappear.
 
 `stop` and `restart` request graceful shutdown and wait up to five minutes for Executors. They never force-kill the process or touch other tmux sessions.
 
@@ -169,7 +176,7 @@ Create the hourly check in the DeepSeek Harness profile you normally use, not in
 Check dsh-superagent: run `scripts/dsh-superagent --profile superagent status` in <checkout>. Exit 0: do nothing and say nothing. Exit 2: do not restart; tell me each part under `errors` with its detail, unless you already told me about the same ones. Exit 3: do not restart; tell me what `setup` says setup needs, unless you already told me. If it reports manually_stopped: true, leave it stopped. Otherwise (exit 1) run `scripts/dsh-superagent --profile superagent --respect-stop restart`, which exits the same way: 0 means it recovered, so say nothing; 2 and 3 are reported as above; if it exits 1 or fails otherwise, read the newest .artifacts/dsh-superagent-superagent-*.log and the Troubleshooting section of docs/006-deployment.md, fix what you can, and tell me what was wrong and what you did.
 ```
 
-`--respect-stop` preserves an intentional stop. Only `stop` writes the marker; `start` clears it. `restart` writes no marker, so the check can recover a restart whose shutdown timed out.
+`--respect-stop` preserves an intentional stop. Only `stop` writes the marker; `start` clears it. `restart` writes no marker, so the check can recover a restart whose shutdown timed out. On Windows, write the same prompt with `node scripts/dsh-superagent`, so the check runs the script under PowerShell.
 
 ## Settings
 
@@ -273,7 +280,7 @@ From an allowed GitHub account, open an Issue or post a comment containing `@<ag
 1. Wait until no Executor is in the middle of a turn.
 2. Back up `<stateDir>/orchestrator.sqlite`.
 3. Run `git pull && pnpm install && pnpm build`.
-4. Run `scripts/dsh-superagent restart` and inspect its status. On Windows, stop and start the process you run instead.
+4. Run `scripts/dsh-superagent restart` and inspect its status; on Windows, run the same step with `node scripts/dsh-superagent restart`.
 
 A restart ends running Assignments and starts replacements with recovery notes. Team text and overridden prompt parts are retained; parts without overrides follow the new defaults. Review parts marked **Default updated** after upgrading.
 
