@@ -75,8 +75,12 @@ export const webhookKind: SourceKind<WebhookConfig> = {
 - `kind` is the stable Source id. It appears in Trigger `source`, Thread-key prefixes, the `source:webhook` settings block and the Source Policy.
 - `schema` validates stored configuration and supplies defaults. Before an operator saves an instance, the registry creates an enabled instance from those defaults. Make defaults receive nothing; this example defaults to no conversations.
 - `fields` generates the Source settings form without custom panel code. A `rows` field edits entries keyed by its first column; `advanced` hides less common settings. Implement `refreshLabels` if the Source can resolve ids to display names. Save those names under `KV.sources.labels(kind)`. Columns with `choose` and `refresh` can then offer them.
-- Optional `facts(deployment)` displays values derived by setup, such as the account behind a CLI. Setup currently checks only GitHub and Feishu fields listed in `SETUP_FIELDS`, so this example supplies no facts.
+- Optional `facts(deployment)` displays values derived by setup, such as the account behind a CLI. A kind declares the configuration fields its setup reads in `setup.fields`; setup checks them when a save changes them. This example supplies no account, so it declares neither.
 - `health` declares the Source's health entries, initially `starting`. Registration claims each name and refuses collisions with entries such as `runtime`, `reply`, `worker` or effect kinds. Use the kind's name and reserve `sync:<id>` for Policy syncs. An `error` makes the status script exit 2 and the hourly check notify the operator, so report it only when human action may be needed.
+- `setup` declares what setup reads and how a save checks it: `fields`, the configuration fields whose values are credentials or CLI names (only the panel may change them, as with the built-in accounts' fields), `problems`, the codes the check reports with the place that fixes each and its words, and `check({ machine, config, probe, path })`, which runs when one of those fields is saved. A Feishu-style optional Source uses it; this example declares none.
+- `healthCodes` declares the fixed words of the kind's own health codes, so `ctx.healthOf(state, code, values)` and the panel's health text need no change to the shared table.
+- `skill` declares the kind's built-in skill: its `name` and either a packaged `file` or its own `text`, with an optional `when(deployment)` that leaves it out while the Source cannot work.
+- `resources` declares the prefix and reader of the kind's original records, so `orchestrator_read webhook/<id>/…` reaches this Source's own records through `read({ commands, resource, rest, config, trigger })`.
 
 ### 3. Translate a message into a Trigger
 
