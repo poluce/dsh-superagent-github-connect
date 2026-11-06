@@ -4,7 +4,6 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
-import { dirname } from 'node:path'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
@@ -14,7 +13,6 @@ import type { Effects } from './effects.ts'
 import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
-import { bundledSkills } from './skill-files.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
@@ -25,7 +23,7 @@ export interface SessionsHost {
   /** DSH Cordis context: sessions, agents, persistence, and their events. */
   readonly context: Context
   readonly store: Pick<Store, 'tickets' | 'settings' | 'get' | 'set' | 'keys'>
-  readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'skills'>
+  readonly prompts: Pick<Prompts, 'current' | 'version' | 'compose' | 'skillDetails'>
   readonly effects: Pick<Effects, 'enqueue' | 'handle' | 'idle' | 'pending'>
   /** The `models` health entry, which reports managed sessions waiting on a model-budget retry. */
   readonly health: HealthEntry
@@ -42,7 +40,7 @@ export interface SessionsHost {
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { key: string; dispose: () => void }; subagent?: true }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
@@ -317,17 +315,18 @@ export class Sessions {
   /** Register the skills of a prompt version in the agent's skill scope, in place of an earlier version's. */
   private bindSkills(binding: SessionBinding, version: PromptVersion): void {
     const { scope, skills: previous } = binding
-    if (!scope || previous?.revision === version.revision) return
+    if (!scope) return
+    const details = this.host.prompts.skillDetails(version.config)
+    // Rebind when the revision or the set of built-in skills changed, such as when a Source kind registers late.
+    const key = `${version.revision}:${details.map(item => item.name).join(',')}`
+    if (previous?.key === key) return
     previous?.dispose()
     const disposers: (() => void)[] = []
-    for (const [name, content] of this.host.prompts.skills(version.config)) {
-      const bundled = name === 'feishu' || name === 'github' ? bundledSkills[name] : undefined
-      const body = version.config.skills[name] ?? ''
-      const description = bundled?.description ?? (body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.')
+    for (const { name, content, description, path } of details) {
       disposers.push(scope.skills.register({ name: `${SKILL_PREFIX}${name}`, description, content, source: 'runtime',
-        ...(bundled ? { resourceBase: { kind: 'directory' as const, path: dirname(bundled.path) } } : {}) }))
+        ...(path ? { resourceBase: { kind: 'directory' as const, path } } : {}) }))
     }
-    binding.skills = { revision: version.revision, dispose: () => { disposers.forEach(dispose => dispose()) } }
+    binding.skills = { key, dispose: () => { disposers.forEach(dispose => dispose()) } }
   }
   /** Return the current prompt version, updating the agent's skills and recording the revision in Store when bound to a model request. */
   private promptFor(agent: Agent, bind: boolean): PromptVersion {

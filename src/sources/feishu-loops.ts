@@ -10,7 +10,7 @@ import { spawnInvocation, validItems, type Tally } from '../infra/commands.ts'
 import { readFeishu, type FeishuRef } from './feishu-read.ts'
 import { feishuRef, feishuTime, feishuTrigger, HistoricalMessageSchema, historyEvent, HistoryPageSchema, SOURCE, topicEvent }
   from './feishu-trigger.ts'
-import { health, type SourceContext } from './host.ts'
+import type { SourceContext } from './host.ts'
 import { family, KV, record } from '../kv.ts'
 import { cursorAt, POLL_HORIZON_MS, polled, pollThreads as pollEach } from './poll.ts'
 import type { FeishuConfig } from './feishu.ts'
@@ -45,7 +45,7 @@ async function receive(ctx: SourceContext, trigger: Trigger): Promise<void> {
 const chatLink = (ctx: SourceContext, chatId: string): string => feishuChatLink(ctx.deployment.feishu?.brand ?? 'feishu', chatId)
 function available(ctx: SourceContext): boolean {
   if (ctx.configured() && ctx.deployment.feishu) return true
-  const waiting = health('paused', ctx.configured() ? 'feishuCliUnset' : 'setupPending')
+  const waiting = ctx.healthOf('paused', ctx.configured() ? 'feishuCliUnset' : 'setupPending')
   ctx.report('feishu', ctx.problem ? { state: 'paused', detail: ctx.problem.detail } : waiting)
   return false
 }
@@ -58,7 +58,7 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   let retry: number | undefined
   while (!signal.aborted) {
     if (!enabled(ctx)) {
-      ctx.report('feishu', health('paused', 'sourceOff'))
+      ctx.report('feishu', ctx.healthOf('paused', 'sourceOff'))
       await delay(5000, undefined, { signal }).catch(() => {})
       continue
     }
@@ -289,14 +289,14 @@ interface BackfillProgress { chat?: string; topics: Record<string, string> }
 const BACKFILL_PROGRESS = family<BackfillProgress, [chat: string]>('feishu-backfill-progress:')
 async function backfillLoop(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   await ctx.ready
-  if (!available(ctx)) { ctx.report('history', health('paused', 'feishuBotMissing')); return }
+  if (!available(ctx)) { ctx.report('history', ctx.healthOf('paused', 'feishuBotMissing')); return }
   // The chats are visited in a rotating order, so a chat that uses up the round's pages does not keep the chats after it
   // from being read in every round; each chat's cursor advances only once its own backfill finished.
   let first = 0
   while (!signal.aborted) {
     const config = enabled(ctx)
     if (!config) {
-      ctx.report('history', health('paused', 'sourceOff'))
+      ctx.report('history', ctx.healthOf('paused', 'sourceOff'))
       await delay(60_000, undefined, { signal }).catch(() => {})
       continue
     }

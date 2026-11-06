@@ -2,10 +2,11 @@
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { UserError, key, latestReport, reached, runningAssignment, threadKey, type Ticket, type Trigger } from '../core/index.ts'
 import { batchOf, inputMessage, triggerMessage, workerSessionId } from '../executor/dsh.ts'
-import { readGithub } from '../sources/github-read.ts'
-import { feishuReferences, feishuRead } from '../sources/feishu-read.ts'
+import { feishuReferences } from '../sources/feishu-read.ts'
 import { feishuRef } from '../sources/feishu.ts'
 import { feishuTriggerId } from '../sources/feishu-trigger.ts'
+import type { SourceResources } from '../sources/kind.ts'
+import type { SourceRegistry } from '../sources/registry.ts'
 import { ASSIGNMENTS, INPUTS, assignmentLine, decisionCard, decisionDetails, inputLine, newestPage, preview, textPage, threadCard, ticketCard,
   ticketDetails, triggerCard, type TicketThread } from './cards.ts'
 import { threadTitle } from './views/records.ts'
@@ -50,23 +51,32 @@ export const RESOURCES: readonly { name: string; holds: string; executor?: true 
   { name: 'prompt-preview/<id>', holds: 'a composed prompt that orchestrator_prompts_save previewed' },
   { name: 'models', holds: 'model providers, the DSH default and each role\'s model' },
   { name: 'models/<provider>', holds: 'one provider\'s models' },
-  { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true },
-  { name: 'github/…', holds: 'a GitHub original, as the dsh-superagent-github skill describes', executor: true },
 ]
-export const resourceGrammar = (executor: boolean): string => RESOURCES.filter(resource => !executor || resource.executor)
+/** A Source kind's original-record resources, which its registration adds to the resource list and the read route. */
+type SourceResourceDescriptor = { name: string; holds: string; executor?: true }
+const SOURCE_RESOURCES = new Map<string, SourceResourceDescriptor>()
+/** Records the original-record resources an installed kind declares; the returned disposer removes them at unregister. */
+export function registerSourceResources(kind: { kind: string; resources?: SourceResources }): () => void {
+  const resources = kind.resources
+  if (resources) SOURCE_RESOURCES.set(kind.kind, { name: resources.name, holds: resources.holds, ...resources.executor ? { executor: true as const } : {} })
+  return () => { SOURCE_RESOURCES.delete(kind.kind) }
+}
+/** Every resource the model may read: the core's, then the installed Sources' originals (`name` naming their prefix). */
+export const resourceDescriptors = (): readonly SourceResourceDescriptor[] => [...RESOURCES, ...SOURCE_RESOURCES.values()]
+export const resourceGrammar = (executor: boolean): string => resourceDescriptors().filter(resource => !executor || resource.executor)
   .map(resource => `${resource.name}: ${resource.holds}`).join('; ')
 
 export interface ResourceHost {
   readonly store: Pick<Store, 'get' | 'settings' | 'triggers' | 'tickets' | 'threads' | 'read' | 'decisions' | 'replyStatus'>
   readonly pages: TextCache
-  readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged'>
+  readonly prompts: Pick<Prompts, 'current' | 'version' | 'history' | 'skills' | 'defaultChanged' | 'parts'>
   readonly commands: Commands
+  readonly sources: SourceRegistry
   readonly masterId: string
   readonly context: Context
   promptVersion(sessionId: string): PromptVersion
   /** Whether a Session may read `revision` (the revision it currently runs under or any revision it ran under previously). */
   mayRead(sessionId: string, revision: number): boolean
-  feishuPageSize(): number
   sourceLink(trigger: Trigger, signal?: AbortSignal): Promise<{ source_url?: string; source_url_read?: string }>
 }
 export interface MainResourceHost extends ResourceHost {
@@ -100,11 +110,11 @@ const trigger = (host: ResourceHost, id: string, ticketId?: string): Trigger => 
   if (ticketId && (!ticket || !readable(host, ticket, found))) throw new UserError('notReached')
   return found
 }
-/** Fetch and cache a source resource on offset 0, serving subsequent offsets from the session cache. */
-async function sourcePage(read: Read, source: string, fetch: () => Promise<unknown>) {
+/** Fetch and cache a Source's original record on offset 0, serving subsequent offsets from the session cache. */
+async function sourcePage(read: Read, label: string, fetch: () => Promise<unknown>) {
   const { host, resource, offset, sessionId } = read
   const body = offset === 0 ? JSON.stringify(await fetch()) : host.pages.get(`${sessionId}:${resource}`)
-  if (body === undefined) throw new Error(`Read this ${source === 'feishu' ? 'Feishu' : 'GitHub'} resource from offset 0 first`)
+  if (body === undefined) throw new Error(`Read this ${label} resource from offset 0 first`)
   if (offset === 0) host.pages.set(`${sessionId}:${resource}`, body)
   return text(read, body)
 }
@@ -177,7 +187,7 @@ const ROUTES: readonly Route[] = [
     const { host, resource, rest, sessionId, ticketId } = read
     const prompts = host.prompts
     const bound = host.promptVersion(sessionId)
-    const parts = () => Object.fromEntries(Object.entries(builtInParts()).map(([key, part]) => [key, part.text]))
+    const parts = () => Object.fromEntries(Object.entries(prompts.parts()).map(([key, part]) => [key, part.text]))
     const version = rest === 'current' ? bound : rest === 'defaults' && !ticketId ? { revision: 0, config: defaultPrompts(), parts: parts() }
       : /^\d+$/.test(rest) ? (Number(rest) === 0 && prompts.current().revision === 0 ? prompts.current() : prompts.version(Number(rest))) : undefined
     if (!version || (ticketId && !host.mayRead(sessionId, version.revision))) throw new Error('Unknown or inaccessible prompt version')
@@ -199,14 +209,6 @@ const ROUTES: readonly Route[] = [
     if (!models) throw new Error('Unknown model provider')
     return list(read, (offset, count) => models.slice(offset, offset + count))
   }],
-  ['feishu/', async read => {
-    const source = trigger(read.host, read.rest.split('/')[0]!, read.ticketId)
-    const ref = feishuRef(source)
-    if (!ref) throw new Error('A Feishu source trigger is required')
-    const commands = read.host.commands.withSignal(read.signal)
-    return sourcePage(read, 'feishu', () => feishuRead(commands, ref, read.resource, read.host.feishuPageSize()))
-  }],
-  ['github/', read => sourcePage(read, 'github', () => readGithub(read.host.commands.withSignal(read.signal), read.resource))],
   ['trigger/', async read => {
     const { host, rest, ticketId, offset, signal } = read
     if (!rest || rest.includes('/')) throw new Error('Unknown context resource')
@@ -300,9 +302,17 @@ export async function readResource(host: ResourceHost, resource: string, offset:
   signal?: AbortSignal) {
   const name = resource.replace(/^event\//, 'trigger/').replace(/^task\//, 'ticket/').replace(/^observation\//, 'decision/')
   const route = ROUTES.find(([route]) => route.endsWith('/') ? name.startsWith(route) : name === route)
-  if (!route) throw new Error('Unknown context resource')
   const sessionId = ticketId ? workerSessionId(ticketId) : host.masterId
-  const rest = route[0].endsWith('/') ? name.slice(route[0].length) : ''
-  return route[1]({ host, resource: name, rest, offset, sessionId, ...limit ? { limit } : {}, ...ticketId ? { ticketId } : {},
-    ...signal ? { signal } : {} })
+  const rest = route?.[0].endsWith('/') ? name.slice(route[0].length) : ''
+  const read: Read = { host, resource: name, rest, offset, sessionId, ...limit ? { limit } : {}, ...ticketId ? { ticketId } : {},
+    ...signal ? { signal } : {} }
+  if (route) return route[1](read)
+  // A Source kind's original records: the kind that declares the resource prefix reads them for its instance's config.
+  const source = host.sources.resourceOf(name)
+  if (!source) throw new Error('Unknown context resource')
+  const prefix = `${source.name.split('/')[0]}/`
+  const label = host.sources.kind(source.kind)?.title.en ?? source.kind
+  return sourcePage(read, label, () => source.read({ commands: host.commands.withSignal(signal), resource: name,
+    rest: name.slice(prefix.length), config: host.sources.instance(source.kind)?.config ?? {},
+    trigger: id => trigger(host, id, ticketId) }))
 }

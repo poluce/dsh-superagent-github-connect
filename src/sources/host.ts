@@ -6,25 +6,36 @@ import type { Deployment } from '../deployment.ts'
 import type { SourceRegistry } from './registry.ts'
 import type { SetupProblem } from '../setup.ts'
 import type { Family, Key } from '../kv.ts'
+import type { Localized } from './kind.ts'
 import { fill } from '../infra/text.ts'
 
-/** Fixed English health templates (`{name}` placeholders); the panel localizes each `code` in the interface language. */
+/** Fixed English health templates of the protocol (`{name}` placeholders); the panel localizes each `code` in the interface language. */
 export const HEALTH_TEXT = {
   setupPending: 'Waiting for the deployment check',
   sourceOff: 'Off',
-  feishuCliUnset: 'The Source is on, and its bot lark-cli is not set',
-  feishuBotMissing: 'Waiting for the Feishu bot',
   pollFailures: '{count} consecutive failed polls; last: {error}',
 } as const
 export type HealthCode = keyof typeof HEALTH_TEXT
-export type Health = { state: 'starting' | 'ready' | 'paused' | 'error'; detail: string; at?: string; code?: HealthCode; values?: Record<string, string> }
+/** Fixed health messages a Source kind declares, by code; the English text is the template, the panel shows the localized words. */
+export type HealthCodes = Readonly<Record<string, Localized>>
+export type Health = { state: 'starting' | 'ready' | 'paused' | 'error'; detail: string; at?: string; code?: string; values?: Record<string, string>; text?: Localized }
 export function health(state: Health['state'], code: HealthCode, values: Record<string, string> = {}): Health {
   return { state, detail: fill(HEALTH_TEXT[code], values), code, ...Object.keys(values).length ? { values } : {} }
 }
+/** Builds a health value for one of a kind's declared codes, or for a shared one; throws for a code the kind does not declare. */
+export function kindHealth(codes: HealthCodes | undefined, state: Health['state'], code: string, values: Record<string, string> = {}): Health {
+  // The protocol's own codes stay available to every kind, and keep their localized keys; a kind's declaration wins otherwise.
+  const declared = codes?.[code]
+  if (declared) return { state, detail: fill(declared.en, values), code, text: declared, ...Object.keys(values).length ? { values } : {} }
+  if (!(code in HEALTH_TEXT)) throw new Error(`The Source has no health code ${code}`)
+  return health(state, code as HealthCode, values)
+}
+/** The kind information a SourceContext is built for: its id, its health entries, and the fixed messages it declares. */
+export interface SourceContextKind { kind: string; health: readonly string[]; healthCodes?: HealthCodes }
 export interface SourceHost {
   readonly sources: SourceRegistry
   /** Returns the context for one Source kind; its `report` writes only the health entries declared by the kind. */
-  context(kind: { kind: string; health: readonly string[] }): SourceContext
+  context(kind: SourceContextKind): SourceContext
 }
 /** Display label, URL, and facts (`null` removes a fact) that a Source publishes on a Thread. */
 export interface ThreadDescription { label?: string; url?: string; facts?: Record<string, ThreadFact | null> }
@@ -36,7 +47,7 @@ export interface SourceContext {
   readonly ready: Promise<void>
   /** True once setup resolved the repository and accounts; Sources poll only then. */
   configured(): boolean
-  /** Setup problem keeping this Source's account from running; only the Feishu bot check reports one. */
+  /** Setup problem keeping this Source's account from running; only the built-in account checks report one. */
   readonly problem?: SetupProblem | undefined
   /** Returns a Source's configuration while enabled, or undefined while disabled or uninstalled. */
   config<C extends Record<string, unknown>>(kind: string): C | undefined
@@ -63,11 +74,13 @@ export interface SourceContext {
   }
   triggers: { get(id: string): Trigger | undefined; /** The newest Trigger on a Thread. */ latest(thread: string): Trigger | undefined }
   notify(message: OutboundMessage): void
+  /** Builds a health value with one of the kind's declared codes, or a protocol code such as `setupPending`. */
+  healthOf(state: Health['state'], code: string, values?: Record<string, string>): Health
   /** Reports the state of one of this kind's declared health entries; throws for undeclared entry names. */
   report(entry: string, health: Health): void
 }
 /** Builds a kind's context and narrows its command surface, so a plugin cannot reach the unrestricted runner. */
-export const sourceContext = (host: SourceHost, kind: { kind: string; health: readonly string[] }): SourceContext => {
+export const sourceContext = (host: SourceHost, kind: SourceContextKind): SourceContext => {
   const context = host.context(kind)
   return Object.assign(context, { commands: sourceCommands(context.commands) })
 }

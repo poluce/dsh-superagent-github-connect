@@ -4,7 +4,9 @@ import { en, GLOSSARY, GLOSSARY_VALUES, zh, type DshSuperagentKey } from '../src
 import { reasonLabel, type T } from '../src/client/text.ts'
 import { REASONS, USER_ERRORS } from '../src/core/index.ts'
 import { HEALTH_TEXT, type HealthCode } from '../src/sources/host.ts'
+import { feishuKind } from '../src/sources/feishu.ts'
 import { SETUP_PROBLEMS, type SetupCode } from '../src/setup.ts'
+import type { Localized } from '../src/sources/kind.ts'
 
 const placeholders = (text: string) => [...text.matchAll(/\{(\w+)\}/g)].map(match => match[1]).sort()
 /** The words a dictionary has for `key`, or undefined when it has none; the key is built at run time, so it is looked up untyped. */
@@ -51,14 +53,17 @@ it('words the reasons agents read in the glossary\'s words: a sender on the list
 })
 
 it('words every health code and setup problem the host reports, in both languages and in the host\'s own words', () => {
-  const healthCodes = Object.keys(HEALTH_TEXT) as HealthCode[]
+  // The protocol's codes keep their localized keys; a Source kind's own codes (such as Feishu's) carry their words too.
+  const declared: Record<string, Localized> = { ...feishuKind.healthCodes }
+  const healthText = (code: string): string | undefined => code in HEALTH_TEXT ? HEALTH_TEXT[code as HealthCode] : declared[code]?.en
+  const healthCodes = [...Object.keys(HEALTH_TEXT), ...Object.keys(declared)]
   expect(healthCodes.filter(code => words(zh, `healthCode.${code}`) === undefined)).toEqual([])
   expect(healthCodes.filter(code => words(en, `healthCode.${code}`) === undefined)).toEqual([])
   // English reuses the host's own text, which the log and the main Session read, so the panel and the log cannot drift apart.
-  expect(healthCodes.filter(code => words(en, `healthCode.${code}`) !== HEALTH_TEXT[code])).toEqual([])
+  expect(healthCodes.filter(code => words(en, `healthCode.${code}`) !== healthText(code))).toEqual([])
   // No stale keys either: a key the host can never report is text nobody reads.
   expect(Object.keys(zh).filter(key => key.startsWith('healthCode.')).map(key => key.slice('healthCode.'.length))
-    .filter(code => !(code in HEALTH_TEXT))).toEqual([])
+    .filter(code => !(code in HEALTH_TEXT) && !(code in declared))).toEqual([])
   const setupCodes = Object.keys(SETUP_PROBLEMS) as SetupCode[]
   expect(setupCodes.filter(code => words(zh, `setup.${code}`) === undefined)).toEqual([])
   expect(setupCodes.filter(code => words(en, `setup.${code}`) !== SETUP_PROBLEMS[code][1])).toEqual([])

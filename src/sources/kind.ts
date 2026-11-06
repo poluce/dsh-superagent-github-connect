@@ -2,11 +2,62 @@
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { z } from 'zod'
 import type { OutboundMessage, ScopeResult, Trigger } from '../core/index.ts'
-import type { Deployment } from '../deployment.ts'
+import type { Deployment, Machine, Probe } from '../deployment.ts'
 import type { Commands } from '../infra/commands.ts'
-import type { SourceContext, SourceHost } from './host.ts'
+import type { SetupProblems } from '../setup.ts'
+import type { HealthCodes, SourceContext, SourceHost } from './host.ts'
 
 export interface Localized { zh: string; en: string }
+/** Deployment setup a kind takes part in, so that generic setup code reads it from the kind rather than naming the Source. */
+export interface SourceSetup {
+  /** Configuration fields setup reads; changing one restarts dsh-superagent and only the management panel may change it. */
+  fields?: readonly string[]
+  /** Problem codes this kind's `check` reports, and the place that fixes them (its Source settings page unless it names another). */
+  problems?: SetupProblems
+  /** Verifies this kind's account settings before the panel saves one of its `fields`. */
+  check?(input: SetupCheckInput): Promise<unknown>
+}
+export interface SetupCheckInput { machine: Machine; config: unknown; probe: Probe; path: string }
+/**
+ * A skill dsh-superagent registers in every Session for this Source; its text is the packaged file, or the kind's own
+ * text when it is not packaged here. The name is the skill's after the `dsh-superagent-` prefix.
+ */
+export interface SourceSkill {
+  /** Skill name after the `dsh-superagent-` prefix; a team skill may not take it. */
+  name: string
+  /** Packaged skill file name under `skills/dsh-superagent-<file>/`; defaults to `name`. */
+  file?: string
+  /** The skill's text when the kind supplies it rather than a packaged file. */
+  text?: string
+  /** Description when the kind supplies the text itself. */
+  description?: string
+  /** Appends the shared CLI usage notes to a packaged skill's text. */
+  cli?: true
+  /** Registers the skill only while this holds (such as a configured bot). */
+  when?(deployment: Deployment | undefined): boolean
+}
+/** What a kind's original records read needs: its CLI calls, the Trigger named by the resource, and its configuration. */
+export interface SourceResourceRead {
+  commands: Commands
+  /** The whole resource name, such as `github/pulls/7`. */
+  resource: string
+  /** The resource name after the kind's prefix, such as `pulls/7`. */
+  rest: string
+  /** The kind's validated configuration. */
+  config: Record<string, unknown>
+  /** Reads the Trigger a resource names, refusing one a worker's Ticket did not reach. */
+  trigger(id: string): Trigger
+}
+/** The original records of one Source, read by agents through `orchestrator_read` under a resource prefix. */
+export interface SourceResources {
+  /** Resource name in the model's resource list, its variable part in `<…>` or `…`; its prefix is the first path segment. */
+  name: string
+  /** What the resources hold, for the model-facing resource list. */
+  holds: string
+  /** Workers may read these resources for their own Ticket. */
+  executor?: true
+  read(input: SourceResourceRead): Promise<unknown>
+}
 /** `advanced` folds a rarely changed field (such as a polling tunable) behind the card's Advanced section. */
 interface FieldBase { key: string; label: Localized; hint?: Localized; advanced?: true }
 /**
@@ -94,6 +145,14 @@ export interface SourceKind<C extends Record<string, unknown> = Record<string, u
   fields: FieldSpec[]
   /** Health entry names owned by this kind under `health[...]`; no other kind or core loop may report them. */
   health: string[]
+  /** Fixed health messages of this kind, by code: the English text is the template `SourceContext.healthOf` fills, and the panel words it in the interface language. */
+  healthCodes?: HealthCodes
+  /** The deployment setup fields, problems and account check this kind takes part in. */
+  setup?: SourceSetup
+  /** The built-in skill every Session registers for this Source. */
+  skill?: SourceSkill
+  /** The prefix and reader of the original records agents read for this Source. */
+  resources?: SourceResources
   /** Listening rule for a trigger (or recorded Mandate basis) of this kind; kinds without `scope` listen to everything they produce and observe none of it. */
   scope?(input: { meta: Record<string, unknown> }, config: C): ScopeResult
   /** Outbound reply adapter; kinds without `channel` produce no replies or channel checks. */

@@ -1,8 +1,11 @@
 /** Manages versioned role prompts, behavioral policies, and operational skills independently of access settings. */
+import { dirname } from 'node:path'
 import { z } from 'zod'
 import { UserError, key } from '../core/index.ts'
 import { policyVersion, type Settings, type SettingsOrigin } from '../policy.ts'
-import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, sourceSkills, cliNotes } from './context.ts'
+import type { SourceSkill } from '../sources/kind.ts'
+import { masterPrompt, workerPrompt, sharedPrompt, guides, mainAdmissionPolicy, handoffPolicy, teamDefaults, cliNotes } from './context.ts'
+import { bundledSkills } from './skill-files.ts'
 import { environmentLines, type Variable } from './execution-environment.ts'
 import { promptsNotice } from './notices.ts'
 import type { Sessions } from './sessions.ts'
@@ -18,13 +21,13 @@ const TEAM_HEADINGS: Record<TeamSection, string> = { communication: 'Communicati
 export const SKILL_NAME = /^[a-z][a-z0-9-]*$/
 /** Prefix prepended to skill names when registering them in DSH Sessions. */
 export const SKILL_PREFIX = 'dsh-superagent-'
-const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !(Object.keys(sourceSkills) as string[]).includes(name),
+const SkillNameSchema = z.string().regex(SKILL_NAME).refine(name => !Object.hasOwn(bundledSkills, name),
   'This name belongs to a built-in skill')
-/** The built-in parts a team may override, by key: both roles' parts, the Source skills, and the generated parts' templates. */
+/** The built-in parts a team may override, by key: both roles' parts, the generated parts' templates, and every Source skill. */
 const PART_KEYS = ['runtime/shared', 'runtime/orchestrator', 'runtime/worker', 'runtime/subscriptions', 'runtime/replies',
   'runtime/dispatch', 'runtime/work', 'runtime/admission', 'runtime/handoff/orchestrator', 'runtime/handoff/worker', 'runtime/environment',
-  'runtime/policy', 'runtime/policy/none', 'skill/feishu', 'skill/github'] as const
-export type PartKey = typeof PART_KEYS[number]
+  'runtime/policy', 'runtime/policy/none'] as const
+export type PartKey = typeof PART_KEYS[number] | `skill/${string}`
 /** A team's text for a built-in part, and `base`, the key of the built-in text it was edited from. */
 const OverrideSchema = z.object({ text: z.string(),
   base: z.string().optional().describe('Key of the built-in text it was edited from; copy as read, or omit.') }).strict()
@@ -47,41 +50,79 @@ type Role = 'orchestrator' | 'worker'
 /** A built-in part a team may override: the roles that read it, its text, and the placeholders a template's override keeps. */
 interface BuiltInPart { roles: readonly Role[]; text: string; placeholders?: readonly string[] }
 const BOTH: readonly Role[] = ['orchestrator', 'worker'], MAIN: readonly Role[] = ['orchestrator'], WORKER: readonly Role[] = ['worker']
-let parts: Readonly<Record<PartKey, BuiltInPart>> | undefined
+/** A packaged Source skill, by the short name its kind declares. */
+const packagedSkill = (name: string): { description: string; content: string; path: string } | undefined =>
+  (bundledSkills as Record<string, { description: string; content: string; path: string } | undefined>)[name]
+/** The packaged skills of this installation as declarations; the `Prompts` default when no registry supplies the kinds. */
+export const packagedSourceSkills = (configured: () => boolean = () => true): readonly SourceSkill[] =>
+  Object.keys(bundledSkills).flatMap(name => name === 'feishu' && !configured() ? [] : [{ name, file: name, cli: true as const }])
+/** A built-in Source skill as its kind declares it, resolved to its text: its description and the directory whose files it exposes. */
+export interface SourceSkillText { name: string; text: string; description?: string; path?: string; cli?: true }
+/** A skill as Sessions register it: the content, the description they show, and the directory of its files when it has one. */
+export interface SkillDetail { name: string; content: string; description: string; path?: string }
 /**
- * The built-in parts of both roles' prompts, the two Source skills, and the templates of the generated parts, whose data the
- * system fills in, by the key an override names them by. Built on first use, as the texts it reads are imported in a cycle.
+ * Resolves skill declarations to their texts: the packaged file when the kind names one, or the kind's own text. A kind
+ * naming a file this installation does not ship registers no skill.
  */
-export const builtInParts = (): Readonly<Record<PartKey, BuiltInPart>> => parts ??= {
-  'runtime/shared': { roles: BOTH, text: sharedPrompt }, 'runtime/orchestrator': { roles: MAIN, text: masterPrompt },
-  'runtime/worker': { roles: WORKER, text: workerPrompt },
-  'runtime/subscriptions': { roles: BOTH, text: `## subscriptions\n${guides.subscriptions}` },
-  'runtime/replies': { roles: BOTH, text: `## replies\n${guides.replies}` },
-  'runtime/dispatch': { roles: MAIN, text: `## dispatch\n${guides.dispatch}` }, 'runtime/work': { roles: WORKER, text: `## work\n${guides.work}` },
-  'runtime/admission': { roles: MAIN, text: mainAdmissionPolicy },
-  'runtime/handoff/orchestrator': { roles: MAIN, text: handoffPolicy('orchestrator') },
-  'runtime/handoff/worker': { roles: WORKER, text: handoffPolicy('worker') },
-  'runtime/environment': { roles: BOTH, text: `${ENVIRONMENT_HEADING}\n{variables}`, placeholders: ['{variables}'] },
-  'runtime/policy': { roles: MAIN, text: `${POLICY_HEAD} The enabled rules, by name and id:\n{rules}`, placeholders: ['{version}', '{mode}', '{rules}'] },
-  'runtime/policy/none': { roles: MAIN, text: `${POLICY_HEAD} No rule is enabled: a proactive candidate can only be ignored.`,
-    placeholders: ['{version}', '{mode}'] },
-  'skill/feishu': { roles: BOTH, text: `${sourceSkills.feishu}\n\n## CLI usage\n${cliNotes}` },
-  'skill/github': { roles: BOTH, text: `${sourceSkills.github}\n\n## CLI usage\n${cliNotes}` },
+export function resolveSourceSkills(skills: readonly SourceSkill[]): SourceSkillText[] {
+  return skills.flatMap(skill => {
+    const packaged = skill.text === undefined ? packagedSkill(skill.file ?? skill.name) : undefined
+    const text = skill.text ?? packaged?.content
+    if (text === undefined) return []
+    const resolved: SourceSkillText = { name: skill.name, text }
+    const description = skill.description ?? packaged?.description
+    if (description !== undefined) resolved.description = description
+    if (packaged) resolved.path = dirname(packaged.path)
+    if (skill.cli) resolved.cli = true
+    return [resolved]
+  })
+}
+/** Every built-in part by key: the fixed parts by their known keys, and the skill parts of the installed kinds. */
+export type BuiltInParts = Readonly<Record<string, BuiltInPart>> & { [K in (typeof PART_KEYS)[number]]: BuiltInPart }
+let parts: { key: string; value: BuiltInParts } | undefined
+/**
+ * The built-in parts of both roles' prompts, the Source skills, and the templates of the generated parts, whose data the
+ * system fills in, by the key an override names them by. Built on first use, as the texts it reads are imported in a cycle;
+ * the skills are the ones the installed kinds declare, and the packaged ones when no registry supplies them.
+ */
+export const builtInParts = (skills: readonly SourceSkill[] = packagedSourceSkills()): BuiltInParts => {
+  const resolved = resolveSourceSkills(skills)
+  const key = JSON.stringify(resolved.map(skill => [skill.name, skill.text, skill.cli]))
+  if (parts?.key === key) return parts.value
+  const value: Record<string, BuiltInPart> = {
+    'runtime/shared': { roles: BOTH, text: sharedPrompt }, 'runtime/orchestrator': { roles: MAIN, text: masterPrompt },
+    'runtime/worker': { roles: WORKER, text: workerPrompt },
+    'runtime/subscriptions': { roles: BOTH, text: `## subscriptions\n${guides.subscriptions}` },
+    'runtime/replies': { roles: BOTH, text: `## replies\n${guides.replies}` },
+    'runtime/dispatch': { roles: MAIN, text: `## dispatch\n${guides.dispatch}` }, 'runtime/work': { roles: WORKER, text: `## work\n${guides.work}` },
+    'runtime/admission': { roles: MAIN, text: mainAdmissionPolicy },
+    'runtime/handoff/orchestrator': { roles: MAIN, text: handoffPolicy('orchestrator') },
+    'runtime/handoff/worker': { roles: WORKER, text: handoffPolicy('worker') },
+    'runtime/environment': { roles: BOTH, text: `${ENVIRONMENT_HEADING}\n{variables}`, placeholders: ['{variables}'] },
+    'runtime/policy': { roles: MAIN, text: `${POLICY_HEAD} The enabled rules, by name and id:\n{rules}`, placeholders: ['{version}', '{mode}', '{rules}'] },
+    'runtime/policy/none': { roles: MAIN, text: `${POLICY_HEAD} No rule is enabled: a proactive candidate can only be ignored.`,
+      placeholders: ['{version}', '{mode}'] },
+    ...Object.fromEntries(resolved.map(skill => [`skill/${skill.name}`, { roles: BOTH,
+      text: `${skill.text}${skill.cli ? `\n\n## CLI usage\n${cliNotes}` : ''}` }])),
+  }
+  parts = { key, value: value as BuiltInParts }
+  return parts.value
 }
 /** The key of a built-in text, which an override's `base` records. */
 export const builtInBase = (text: string): string => key('prompt-built-in', text)
 /** The built-in part a key names, if any; a name an object's prototype has names none. */
-export const builtInPart = (part: string): BuiltInPart | undefined =>
-  Object.hasOwn(builtInParts(), part) ? builtInParts()[part as PartKey] : undefined
+export const builtInPart = (part: string, skills: readonly SourceSkill[] = packagedSourceSkills()): BuiltInPart | undefined =>
+  Object.hasOwn(builtInParts(skills), part) ? builtInParts(skills)[part] : undefined
 /** The text of a built-in part: the team's override, else the built-in one. */
-const builtIn = (config: PromptConfig, part: PartKey): string =>
-  (config.overrides && Object.hasOwn(config.overrides, part) ? config.overrides[part]!.text : undefined) ?? builtInParts()[part].text
+const builtIn = (config: PromptConfig, part: PartKey, skills: readonly SourceSkill[] = packagedSourceSkills()): string =>
+  (config.overrides && Object.hasOwn(config.overrides, part) ? config.overrides[part]!.text : undefined) ?? builtInParts(skills)[part]!.text
 /** Fill a template's placeholders in one pass, so text filled in is not read for placeholders again. */
 const fill = (template: string, values: Record<string, string>): string =>
   template.replace(/\{(\w+)\}/g, (match, name: string) => Object.hasOwn(values, name) ? values[name]! : match)
 /** The execution environment part: its template with the variables, or, while setup waits, that it waits. */
-export function environmentSection(config: PromptConfig, variables: Variable[] | undefined): string {
-  return variables ? fill(builtIn(config, 'runtime/environment'), { variables: environmentLines(variables) })
+export function environmentSection(config: PromptConfig, variables: Variable[] | undefined,
+  skills: readonly SourceSkill[] = packagedSourceSkills()): string {
+  return variables ? fill(builtIn(config, 'runtime/environment', skills), { variables: environmentLines(variables) })
     : 'Execution environment: dsh-superagent is waiting for setup; the management panel names what is missing.'
 }
 /**
@@ -89,19 +130,21 @@ export function environmentSection(config: PromptConfig, variables: Variable[] |
  * rule, as the settings hold them, each on one line, so a line of an instruction reads as no rule or heading of its own; the
  * settings bound each instruction (`LIMITS.ruleInstruction`). `key` names the template it was filled from.
  */
-export function policySection(settings: Settings, config: PromptConfig = defaultPrompts()): { key: string; text: string } {
+export function policySection(settings: Settings, config: PromptConfig = defaultPrompts(),
+  skills: readonly SourceSkill[] = packagedSourceSkills()): { key: string; text: string } {
   const line = (text: string) => text.replace(/\s*\n\s*/g, ' ')
   const rules = settings.policy.rules.filter(rule => rule.enabled).map(({ id, name, instruction }) => `- ${line(name)} (${id}): ${line(instruction)}`)
   const part = rules.length ? 'runtime/policy' : 'runtime/policy/none'
-  return { key: part, text: fill(builtIn(config, part), { version: policyVersion(settings), mode: settings.eval.mode, rules: rules.join('\n') }) }
+  return { key: part, text: fill(builtIn(config, part, skills), { version: policyVersion(settings), mode: settings.eval.mode, rules: rules.join('\n') }) }
 }
 /**
  * Assemble a role's system prompt sections in order from fixed templates, team sections, the generated execution environment
  * and, last, the main Session's generated Policy section, which nothing follows, and whose change leaves the rest unchanged.
  */
-export function promptParts(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string }) {
+export function promptParts(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string },
+  skills: readonly SourceSkill[] = packagedSourceSkills()) {
   // A built-in part names the key its text is overridden by, which for the handoff names the role.
-  const fixed = (name: string, part = name) => ({ name, kind: 'fixed' as const, key: part, text: builtIn(config, part as PartKey) })
+  const fixed = (name: string, part = name) => ({ name, kind: 'fixed' as const, key: part, text: builtIn(config, part as PartKey, skills) })
   const team = (name: TeamSection) => ({ name, kind: 'team' as const, heading: `## ${TEAM_HEADINGS[name]}`,
     text: config[name] ? `## ${TEAM_HEADINGS[name]}\n${config[name]}` : '' })
   return [
@@ -114,11 +157,12 @@ export function promptParts(config: PromptConfig, role: Role, environment?: stri
     ...role === 'orchestrator' && policy ? [{ name: 'runtime/policy', kind: 'generated' as const, ...policy }] : [],
   ].filter(part => part.text)
 }
-export function composePrompt(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string }): string {
-  return promptParts(config, role, environment, policy).map(part => part.text).join('\n\n')
+export function composePrompt(config: PromptConfig, role: Role, environment?: string, policy?: { key: string; text: string },
+  skills: readonly SourceSkill[] = packagedSourceSkills()): string {
+  return promptParts(config, role, environment, policy, skills).map(part => part.text).join('\n\n')
 }
-export function composeSkill(config: PromptConfig, name: string): string {
-  return name === 'feishu' || name === 'github' ? builtIn(config, `skill/${name}`) : config.skills[name] ?? ''
+export function composeSkill(config: PromptConfig, name: string, skills: readonly SourceSkill[] = packagedSourceSkills()): string {
+  return Object.hasOwn(builtInParts(skills), `skill/${name}`) ? builtIn(config, `skill/${name}`, skills) : config.skills[name] ?? ''
 }
 
 /** An override whose built-in text changed since its `base`, with that text when kept, or whose part this version no longer has. */
@@ -134,18 +178,40 @@ export class PromptConflict extends Error {}
  */
 export class Prompts {
   private readonly versions: Versions<PromptVersion>
+  /** Declarations of the built-in Source skills that register now, from the installed kinds (or from the packaged files). */
+  private readonly sourceSkills: () => readonly SourceSkill[]
   constructor(private readonly store: Store, private readonly maxChars: () => number, private readonly environment: () => Variable[] | undefined,
-    private readonly feishu: () => boolean) {
+    feishu: () => boolean, sourceSkills?: () => readonly SourceSkill[]) {
     this.versions = new Versions(store, KV.prompts.revision, KV.prompts.version)
+    this.sourceSkills = sourceSkills ?? (() => packagedSourceSkills(feishu))
   }
+  /** The built-in skills registering now, packaged and kind-declared. */
+  private skillDeclarations(): readonly SourceSkill[] { return this.sourceSkills() }
   /** A role's prompt; the main Session's Policy section follows the settings as they are now, at each model request. */
   compose(config: PromptConfig, role: Role, variables = this.environment()): string {
-    return composePrompt(config, role, environmentSection(config, variables), role === 'orchestrator' ? policySection(this.store.settings(), config) : undefined)
+    const skills = this.skillDeclarations()
+    return composePrompt(config, role, environmentSection(config, variables, skills),
+      role === 'orchestrator' ? policySection(this.store.settings(), config, skills) : undefined, skills)
   }
-  /** Returns skills to register in every Session: built-in Source skills (`feishu` only when a Feishu bot is configured) followed by team skills. */
+  /**
+   * Returns the skills to register in every Session: the built-in Source skills the installed kinds declare (such as the
+   * Feishu one only with a bot configured) followed by team skills, each with its content.
+   */
   skills(config: PromptConfig): [string, string][] {
-    return [...this.feishu() ? ['feishu'] : [], 'github', ...Object.keys(config.skills)].map(name => [name, composeSkill(config, name)])
+    return this.skillDetails(config).map(({ name, content }) => [name, content])
   }
+  /** The skills to register with the description and files the Session registers them with, built-in ones first. */
+  skillDetails(config: PromptConfig): SkillDetail[] {
+    const declarations = this.skillDeclarations()
+    return [
+      ...resolveSourceSkills(declarations).map(skill => ({ name: skill.name, content: composeSkill(config, skill.name, declarations),
+        description: skill.description ?? 'Custom dsh-superagent operational skill.', ...skill.path ? { path: skill.path } : {} })),
+      ...Object.entries(config.skills).map(([name, body]) => ({ name, content: body,
+        description: body.replace(/\s+/g, ' ').slice(0, 120) || 'Custom dsh-superagent operational skill.' })),
+    ]
+  }
+  /** The built-in parts this installation has, the Source skills included, by the key an override names them. */
+  parts(): BuiltInParts { return builtInParts(this.skillDeclarations()) }
   current(): PromptVersion {
     const revision = this.versions.revision()
     return revision ? this.version(revision) : { revision: 0, previousRevision: null, savedAt: '', source: 'defaults', config: defaultPrompts() }
@@ -163,9 +229,13 @@ export class Prompts {
    */
   validate(value: unknown): PromptConfig {
     const { overrides, ...config } = PromptConfigSchema.parse(value)
+    const skills = this.skillDeclarations()
+    const declared = new Set(skills.map(skill => skill.name))
+    const reserved = Object.keys(config.skills).find(name => declared.has(name))
+    if (reserved !== undefined) throw new Error(`This name belongs to a built-in skill: ${reserved}`)
     const saved = this.current().config.overrides ?? {}
     const kept = Object.entries(overrides ?? {}).flatMap(([name, override]) => {
-      const part = builtInPart(name)
+      const part = builtInPart(name, skills)
       if (!part && Object.hasOwn(saved, name)) return []
       if (!part) throw new UserError('unknownPromptPart', { part: name })
       if (!override.text.trim()) throw new UserError('promptPartEmpty', { part: name })
@@ -184,8 +254,9 @@ export class Prompts {
    * with the built-in text of that base when this installation kept it, and those of a part this version no longer has.
    */
   defaultChanged(config: PromptConfig): DefaultChange[] {
+    const skills = this.skillDeclarations()
     return Object.entries(config.overrides ?? {}).flatMap(([part, { base }]): DefaultChange[] => {
-      const now = builtInPart(part)
+      const now = builtInPart(part, skills)
       if (!now) return [{ part, ...base === undefined ? {} : { base }, removed: true as const }]
       if (base === undefined || base === builtInBase(now.text)) return []
       const previous = this.store.get(KV.prompts.builtIn(base))
@@ -193,10 +264,10 @@ export class Prompts {
     })
   }
   preview(value: unknown) {
-    const config = this.validate(value)
-    const environment = environmentSection(config, this.environment()), policy = policySection(this.store.settings(), config)
-    return { orchestrator: composePrompt(config, 'orchestrator', environment, policy), worker: composePrompt(config, 'worker', environment),
-      parts: { orchestrator: promptParts(config, 'orchestrator', environment, policy), worker: promptParts(config, 'worker', environment) },
+    const config = this.validate(value), skills = this.skillDeclarations()
+    const environment = environmentSection(config, this.environment(), skills), policy = policySection(this.store.settings(), config, skills)
+    return { orchestrator: composePrompt(config, 'orchestrator', environment, policy, skills), worker: composePrompt(config, 'worker', environment, undefined, skills),
+      parts: { orchestrator: promptParts(config, 'orchestrator', environment, policy, skills), worker: promptParts(config, 'worker', environment, undefined, skills) },
       skills: Object.fromEntries(this.skills(config)), scope: 'Team sections, skills, and overrides of built-in parts, which follow their built-in text until overridden. Workers additionally inherit the host prompt and repository AGENTS.md. Prompt text changes what the agents are told, not what dsh-superagent allows: tool permissions, the gate and account wrappers stay.' }
   }
   save(value: unknown, baseRevision: number, source: SettingsOrigin): PromptVersion {
@@ -207,8 +278,9 @@ export class Prompts {
       // Persist the built-in defaults as revision 0 before recording the first custom revision.
       if (previous.revision === 0 && !this.versions.get(0)) this.versions.keep(previous)
       // The built-in text each override was edited from, kept to show what an upgrade changed in it.
+      const parts = builtInParts(this.skillDeclarations())
       for (const [part, { base }] of Object.entries(config.overrides ?? {})) {
-        const text = builtInParts()[part as PartKey].text
+        const text = parts[part]!.text
         if (base === builtInBase(text) && this.store.get(KV.prompts.builtIn(base)) === undefined) this.store.set(KV.prompts.builtIn(base), text)
       }
       return this.versions.save(revision => ({ revision, previousRevision: previous.revision, savedAt: new Date().toISOString(), source, config }))

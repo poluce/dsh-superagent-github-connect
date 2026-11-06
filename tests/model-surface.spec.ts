@@ -10,7 +10,7 @@ import { afterAll, beforeAll, expect, it, vi } from 'vitest'
 import type { UserMessage } from '@deepseek-ai/dsh-llm'
 import { latestAssignment } from '../src/core/index.ts'
 import { promptParts } from '../src/app/prompts.ts'
-import { RESOURCES } from '../src/app/resources.ts'
+import { resourceDescriptors } from '../src/app/resources.ts'
 import { TICKET_STATES } from '../src/app/cards.ts'
 import { Runtime } from '../src/app/runtime.ts'
 import { workerSessionId } from '../src/executor/dsh.ts'
@@ -43,7 +43,7 @@ const NOTICES = 'src/app/notices.ts', LINKS = 'src/app/links.ts', ASSESSMENT = '
 const EXECUTOR = 'src/executor/dsh.ts', ERRORS = 'src/core/errors.ts'
 const TICKETS = 'src/core/tickets.ts', ASSIGNMENTS = 'src/core/assignments.ts'
 /** Regex patterns compiled from `orchestrator_read` resource templates (`<…>` matches one path segment; `…` matches the rest). */
-const RESOURCE_NAMES = RESOURCES.map(({ name }) => new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/<[^>]+>/g, '[^/\\s]+').replace('…', '.+')}$`))
+const resourceNames = (): RegExp[] => resourceDescriptors().map(({ name }) => new RegExp(`^${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/<[^>]+>/g, '[^/\\s]+').replace('…', '.+')}$`))
 /** Report and assignment states, which text names as such; a ticket or a worker is in one of the card states (TICKET_STATES). */
 const REPORT_WORDS = /^(ready|waiting|blocked|failed|progress|running|queued)$/
 /** Retired terminology superseded by `docs/001`. */
@@ -328,7 +328,7 @@ function failures(): Map<string, string> {
     for (const [phrase] of text.matchAll(/\bwait(?:ing)? for (?:ready|waiting|blocked|failed)\b(?! report)/g)) fail(`"${phrase}" names a report state without report`)
     for (const [found] of text.matchAll(/\b(?:ticket|trigger|decision|prompts|prompt-preview|models|feishu|github)\/[^\s"'`,;)\]]*/g)) {
       const name = found.replace(/[.:]+$/, '')
-      if (!RESOURCE_NAMES.some(pattern => pattern.test(name))) fail(`${name} is not a resource orchestrator_read reads`)
+      if (!resourceNames().some(pattern => pattern.test(name))) fail(`${name} is not a resource orchestrator_read reads`)
     }
     // Text only one role reads names the other role's tools only in a sentence that says the other role uses them.
     const other = role === 'orchestrator' ? 'worker' : role === 'worker' ? 'orchestrator' : undefined

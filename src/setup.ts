@@ -1,27 +1,34 @@
 /** Structured startup and configuration errors with the settings location where the operator can fix them. */
 import { fill } from './infra/text.ts'
+import type { Localized } from './sources/kind.ts'
+import { FEISHU_SETUP_PROBLEMS, GITHUB_SETUP_PROBLEMS } from './sources/setup-problems.ts'
 
-export type SetupPlace = 'deployment' | 'github' | 'feishu'
-export const SETUP_PROBLEMS = {
+/**
+ * Place an operator fixes a setup problem: the deployment settings, a Source kind's settings page, or another place a
+ * kind names (`setup.problems`); the panel opens this place from the problem.
+ */
+export type SetupPlace = 'deployment' | 'github' | 'feishu' | (string & {})
+/**
+ * One setup problem's place, the host's English text with `{value}` placeholders `SetupError` fills, and, for a kind that
+ * is not built in, the words the panel shows instead of a localization of its own.
+ */
+export type SetupProblemSpec = readonly [place: SetupPlace, text: string, words?: Localized]
+/** The setup problems a part of dsh-superagent reports, by code. */
+export type SetupProblems = Readonly<Record<string, SetupProblemSpec>>
+/** Problems of dsh-superagent itself, fixed in the deployment settings rather than on a Source. */
+const DEPLOYMENT_SETUP_PROBLEMS = {
   foreignFile: ['deployment', '{file} was not written by dsh-superagent; move it, or choose another state directory.'],
   gitTooOld: ['deployment', 'git does not read the github.com credential configuration dsh-superagent writes; dsh-superagent needs git 2.32 or later.'],
   environmentFailed: ['deployment', 'Preparing the agent environment failed.'],
-  repositoryUnset: ['github', 'The GitHub Source names no repository.'],
-  agentCliUnset: ['github', 'The agent GitHub CLI is not set.'],
-  agentCliMissing: ['github', 'The agent GitHub CLI was not found.'],
-  agentCliSignedOut: ['github', 'The agent GitHub CLI cannot read its account.'],
-  agentCliNoAccount: ['github', 'The agent GitHub CLI did not report a GitHub account.'],
-  repositoryUnreadable: ['github', '@{account} cannot read {repository}.'],
-  repositoryUnreported: ['github', 'The agent GitHub CLI did not return {repository}.'],
-  repositoryReadOnly: ['github', '@{account} cannot push to {repository}.'],
-  feishuCliFailed: ['feishu', 'The bot lark-cli does not work.'],
-  feishuNoApp: ['feishu', 'auth status of the bot lark-cli did not report the app.'],
-  feishuBotNotReady: ['feishu', 'The bot identity of app {app} is {status}; configure the app secret with lark-cli.'],
-  feishuUserIdentity: ['feishu', 'The bot lark-cli allows user identities (strict mode {mode}); give the bot its own lark-cli configuration in strict mode bot, as docs/006-deployment.md describes.'],
-  feishuNoBot: ['feishu', 'The Feishu bot API did not return the bot\'s open_id.'],
-} as const satisfies Record<string, readonly [SetupPlace, string]>
+} as const satisfies SetupProblems
+/**
+ * Every setup problem dsh-superagent itself reports, by code: the deployment's, and those of the built-in Source kinds'
+ * account checks. A Source kind that is not built in declares its own table on its kind (`SourceKind.setup.problems`) and
+ * throws it as the third argument of `SetupError`.
+ */
+export const SETUP_PROBLEMS = { ...DEPLOYMENT_SETUP_PROBLEMS, ...GITHUB_SETUP_PROBLEMS, ...FEISHU_SETUP_PROBLEMS } as const satisfies SetupProblems
 export type SetupCode = keyof typeof SETUP_PROBLEMS
-export interface SetupProblem { place: SetupPlace; code: SetupCode; values: Record<string, string>; detail: string }
+export interface SetupProblem { place: SetupPlace; code: string; values: Record<string, string>; detail: string; text?: Localized }
 
 /**
  * Thrown by deployment and account verification checks when a required CLI, account, or repository check fails.
@@ -29,11 +36,17 @@ export interface SetupProblem { place: SetupPlace; code: SetupCode; values: Reco
  */
 export class SetupError extends Error {
   readonly place: SetupPlace
-  constructor(readonly code: SetupCode, readonly values: Record<string, string> = {}) {
-    const [place, text] = SETUP_PROBLEMS[code]
+  readonly words?: Localized
+  constructor(readonly code: string, readonly values: Record<string, string> = {}, problems: SetupProblems = SETUP_PROBLEMS) {
+    const spec = problems[code]
+    if (!spec) throw new Error(`dsh-superagent has no setup problem for the code ${code}`)
+    const [place, text, words] = spec
     const sentence = fill(text, values)
     super(values.output ? `${sentence}\n${values.output}` : sentence)
     this.place = place
+    if (words) this.words = words
   }
-  get problem(): SetupProblem { return { place: this.place, code: this.code, values: this.values, detail: this.message } }
+  get problem(): SetupProblem {
+    return { place: this.place, code: this.code, values: this.values, detail: this.message, ...this.words ? { text: this.words } : {} }
+  }
 }

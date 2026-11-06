@@ -1,11 +1,12 @@
 /** Feishu source kind definition, policy synchronization, and Cordis plugin entry. */
 import type { Context } from '@deepseek-ai/cordis'
 import { z } from 'zod'
-import { FeishuBotSchema } from '../deployment.ts'
+import { FeishuBotSchema, resolveFeishuBot } from '../deployment.ts'
+import { FEISHU_SETUP_PROBLEMS } from './setup-problems.ts'
 import { feishuLink, sendFeishu } from './feishu-channel.ts'
-import { feishuThreadContext } from './feishu-read.ts'
+import { feishuRead, feishuThreadContext } from './feishu-read.ts'
 import { refreshChatNames, runFeishu } from './feishu-loops.ts'
-import { SOURCE, feishuTriggerId } from './feishu-trigger.ts'
+import { SOURCE, feishuRef, feishuTriggerId } from './feishu-trigger.ts'
 import { sourceContext } from './host.ts'
 import type { Localized, SourceKind } from './kind.ts'
 import type { SourceRegistry } from './registry.ts'
@@ -28,6 +29,11 @@ const FeishuConfigSchema = FeishuBotSchema.extend({
   otherChats: z.enum(['none', 'mentions']).default('none'),
 }).strict()
 export type FeishuConfig = z.infer<typeof FeishuConfigSchema>
+/** The Feishu Source's own health messages, beside the protocol's shared ones; the panel words them in either language. */
+export const FEISHU_HEALTH_CODES = {
+  feishuCliUnset: { zh: '来源已打开，还没有设置机器人的 lark-cli', en: 'The Source is on, and its bot lark-cli is not set' },
+  feishuBotMissing: { zh: '等待飞书机器人', en: 'Waiting for the Feishu bot' },
+} as const
 export const feishuKind: SourceKind<FeishuConfig> = {
   kind: SOURCE,
   refreshLabels: (host, signal) => refreshChatNames(sourceContext(host, feishuKind), signal),
@@ -51,6 +57,23 @@ export const feishuKind: SourceKind<FeishuConfig> = {
       hint: { zh: '查询原消息链接最多等待的时间；超时后智能体改为直接读取原消息。', en: 'How long to wait for an original message\'s link; after that, agents read the message itself.' } },
   ],
   health: ['feishu', 'history'],
+  healthCodes: FEISHU_HEALTH_CODES,
+  // The bot lark-cli is deployment setup: only the panel may change it, and a save checks the bot.
+  setup: {
+    fields: Object.keys(FeishuBotSchema.shape),
+    problems: FEISHU_SETUP_PROBLEMS,
+    check: ({ machine, config, probe, path }) => resolveFeishuBot(machine, config, probe, path),
+  },
+  // The built-in skill packs the read paths and the CLI notes workers use; it registers only with a bot configured.
+  skill: { name: 'feishu', file: 'feishu', cli: true, when: deployment => !!deployment?.feishu },
+  // Agents read Feishu originals, named by the Trigger they came from, under `feishu/<trigger-id>/…`.
+  resources: { name: 'feishu/<trigger-id>/…', holds: 'a Feishu original, as the dsh-superagent-feishu skill describes', executor: true,
+    read: ({ commands, resource, rest, trigger, config }) => {
+      const source = trigger(rest.split('/')[0]!)
+      const ref = feishuRef(source)
+      if (!ref) throw new Error('A Feishu source trigger is required')
+      return feishuRead(commands, ref, resource, (config as FeishuConfig).readPageSize)
+    } },
   scope({ meta }, config) {
     if (meta.direct === true) return config.directMessages ? { listened: true, observed: false, row: 'direct' } : { listened: false, reason: 'direct_messages_not_allowed' }
     const chat = config.chats.find(item => item.chatId === meta.chatId)
