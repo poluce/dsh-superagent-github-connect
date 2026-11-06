@@ -1,14 +1,15 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { Engine, MemoryRepositories, key, type Assessor, type Executor, type Thread, type Ticket, type Trigger } from '../src/core/index.ts'
+import { Engine, MemoryRepositories, key, type Assessor, type Executor, type ReceiveResult, type Thread, type Ticket, type Trigger }
+  from '../src/core/index.ts'
 import { backfillChat, consumerRetry, feishuKind, feishuTriggerId, feishuRef, feishuTime, feishuTrigger, historyEvent }
   from '../src/sources/feishu.ts'
 import { KV } from '../src/kv.ts'
 import { apply as applyFeishu, pollThreads as pollFeishuThreads } from '../src/sources/feishu.ts'
-import { runFeishu } from '../src/sources/feishu-loops.ts'
+import { runFeishu, LIVE_RETRY_LIMIT, queueLiveEvent, retryLiveEvents, SEEN_LIMIT, takeLine } from '../src/sources/feishu-loops.ts'
 import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
 import { ciCounts, ciFact, ciSummary } from '../src/sources/github-read.ts'
-import { apply as applyGithub, githubKind, pollFailure, pollRound } from '../src/sources/github.ts'
+import { apply as applyGithub, githubKind, limitBackoff, pollFailure, pollRound, rateLimitSeconds } from '../src/sources/github.ts'
 import { pollThreads as pollGithubThreads } from '../src/sources/github.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { cursorAt, POLL_HORIZON_MS } from '../src/sources/poll.ts'
@@ -299,6 +300,131 @@ describe('feishu source', () => {
     await backfillChat(h, 'oc_team', false, since, new Date().toISOString(), new AbortController().signal, tally)
     expect(tally.skipped).toBe(1)
     expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.messageId)).toEqual(['om_good'])
+    h.store.close()
+  })
+  it('recovers history from the polling horizon when its cursor is older than that, instead of reading every message since', async () => {
+    const h = host()
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    const starts: number[] = []
+    vi.spyOn(h.commands, 'lark').mockImplementation(async args => {
+      const parameters = JSON.parse(args[args.indexOf('--params') + 1]!) as { start_time: string }
+      starts.push(Number(parameters.start_time))
+      return { has_more: false, items: [] }
+    })
+    const until = new Date().toISOString()
+    const since = new Date(Date.now() - 30 * 24 * 3600_000).toISOString()
+    const read = await backfillChat(h, 'oc_team', false, since, until, new AbortController().signal)
+    // The cursor is clamped to the horizon, and the result says so rather than letting the loss stay silent.
+    expect(read).toEqual({ complete: true, clamped: true })
+    expect(starts).toEqual([Math.floor((Date.parse(until) - POLL_HORIZON_MS) / 1000)])
+    h.store.close()
+  })
+  it('stops a chat\'s history recovery at the round page budget and resumes where it stopped next round', async () => {
+    const h = host()
+    vi.spyOn(h.commands, 'withSignal').mockReturnValue(h.commands)
+    const start = Date.parse('2026-09-01T00:00:00.000Z')
+    const starts: number[] = []
+    let calls = 0
+    vi.spyOn(h.commands, 'lark').mockImplementation(async args => {
+      const parameters = JSON.parse(args[args.indexOf('--params') + 1]!) as { start_time: string }
+      starts.push(Number(parameters.start_time))
+      const index = calls++
+      // Four pages in all, one message each, so the fourth page ends the scan.
+      return { has_more: index < 3, ...(index < 3 ? { page_token: `p${index + 1}` } : {}),
+        items: [{ message_id: `om_${index}`, chat_id: 'oc_team', create_time: String(start + (index + 1) * 60_000),
+          sender: { id: 'ou_guest', sender_type: 'user' }, body: { content: '{"text":"hi"}' } }] }
+    })
+    const since = new Date(start - 60_000).toISOString()
+    const until = new Date(start + 3_600_000).toISOString()
+    const read = async (pages: number) =>
+      backfillChat(h, 'oc_team', false, since, until, new AbortController().signal, { skipped: 0 }, { pages })
+    const first = await read(2)
+    expect(first).toEqual({ complete: false })
+    expect(starts).toEqual([Math.floor(Date.parse(since) / 1000), Math.floor(Date.parse(since) / 1000)])
+    // The next round reads on from five seconds before the newest message it read, instead of the pages before it.
+    const resumed = Math.floor((start + 2 * 60_000 - 5000) / 1000)
+    const second = await read(2)
+    expect(second).toEqual({ complete: true })
+    expect(starts.slice(2)).toEqual([resumed, resumed])
+    // The watermarks are forgotten once everything up to `until` is read, so the caller may advance the cursor.
+    expect(h.store.get('feishu-backfill-progress:oc_team')).toBeUndefined()
+    h.store.close()
+  })
+  it('keeps only the newest messages a polled topic remembers, so its checkpoint stays bounded', async () => {
+    const h = host()
+    const source = feishuTrigger({ message_id: 'om_root', chat_id: 'oc_1', chat_type: 'group', sender_id: MEMBER, sender_type: 'user',
+      content: '@bot fix', create_time: '1', mentions: [{ id: 'ou_bot' }] }, 'ou_bot', 'cli_bot')!
+    h.store.triggers.save(source)
+    subscribed(h, source.threads[0]!, { chatId: 'oc_1', messageId: 'om_root', sourceTriggerId: source.id })
+    h.store.threads.save({ ...h.store.threads.get('feishu:oc_1:om_root')!, lastAt: new Date().toISOString() })
+    h.store.set('thread-initialized:feishu:oc_1:om_root', true)
+    h.store.set('thread-seen:feishu:oc_1:om_root', Array.from({ length: SEEN_LIMIT }, (_, index) => `om_old_${index}`))
+    const reply = (id: string) => ({ message_id: id, chat_id: 'oc_1', msg_type: 'text', content: `reply ${id}`,
+      create_time: String(Date.now()), sender: { id: 'ou_guest', sender_type: 'user' }, thread_id: 'omt_1', root_id: 'om_root' })
+    vi.spyOn(h.commands, 'lark').mockImplementation(async args => {
+      if (args[0] === 'api') return { items: [{ message_id: 'om_root', chat_id: 'oc_1', thread_id: 'omt_1' }] }
+      if (args[1] === '+messages-mget') return { messages: [] }
+      // Newest first, as Feishu lists a topic.
+      return { thread_id: 'omt_1', has_more: false, messages: [reply('om_new_5'), reply('om_new_4'), reply('om_new_3')] }
+    })
+    await pollFeishuThreads(h)
+    const seen = h.store.get<string[]>('thread-seen:feishu:oc_1:om_root')!
+    expect(seen).toHaveLength(SEEN_LIMIT)
+    expect(seen.slice(-3)).toEqual(['om_new_3', 'om_new_4', 'om_new_5'])
+    // The oldest messages are forgotten; reading them again is harmless because each produces the same Trigger ID.
+    expect(seen).not.toContain('om_old_0')
+    h.store.close()
+  })
+  it('reports a background loop that dies as its health instead of letting it settle silently', async () => {
+    const h = host({ ready: Promise.reject(new Error('lock held')) })
+    // The promise of runFeishu never rejects: each loop's escape is reported, as the GitHub polling loop's escape is.
+    await expect(runFeishu(h, new AbortController().signal)).resolves.toBeDefined()
+    expect(h.health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('lock held') })
+    expect(h.health.history).toMatchObject({ state: 'error', detail: expect.stringContaining('lock held') })
+    h.store.close()
+  })
+  it('keeps a live event whose handling failed and retries it, so a failure loses no message', async () => {
+    let failing = true
+    const receive = vi.fn(async (): Promise<ReceiveResult> => { if (failing) throw new Error('the Engine is busy'); return 'stored' })
+    const h = host({ receive })
+    // The plugin entry hands the Source its scoped context, which is the one that carries the Engine interaction.
+    const ctx = h.context(feishuKind)
+    const line = JSON.stringify({ message_id: 'om_kept', chat_id: 'oc_team', chat_type: 'group', sender_id: MEMBER,
+      sender_type: 'user', content: '@bot fix', create_time: String(Date.now()), mentions: [{ id: 'ou_bot' }] })
+    // A line the consumer prints is applied; one it cannot deliver is kept in the store and reported as kept for retry.
+    expect(await takeLine(ctx, 'not json', new AbortController().signal)).toBe(false)
+    expect(h.store.get('feishu-live-retry')).toBeUndefined()
+    expect(h.health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('JSON') })
+    expect(await takeLine(ctx, line, new AbortController().signal)).toBe(true)
+    expect(h.store.get<unknown[]>('feishu-live-retry')).toHaveLength(1)
+    expect(h.health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('kept for retry') })
+    // A retry that fails again keeps the event and reports it.
+    expect(await retryLiveEvents(ctx)).toBe(0)
+    expect(h.store.get('feishu-live-retry')).toMatchObject([{ line, attempts: 1 }])
+    expect(h.health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('the Engine is busy') })
+    // Once the Engine takes it, the kept event is delivered and removed.
+    failing = false
+    expect(await retryLiveEvents(ctx)).toBe(1)
+    expect(h.store.get('feishu-live-retry')).toBeUndefined()
+    expect(receive).toHaveBeenCalledWith(expect.objectContaining({ id: key('feishu', 'om_kept'), text: '@bot fix' }))
+    expect(h.health.feishu).toMatchObject({ state: 'ready', detail: 'Listening for bot events; 1 kept event recovered' })
+    h.store.close()
+  })
+  it('abandons a kept live event after a day and bounds how many it keeps, naming both in the health', async () => {
+    const h = host({ receive: vi.fn(async (): Promise<ReceiveResult> => { throw new Error('the Engine is busy') }) })
+    const ctx = h.context(feishuKind)
+    const line = (id: string) => JSON.stringify({ message_id: id, chat_id: 'oc_team', chat_type: 'group', sender_id: MEMBER,
+      sender_type: 'user', content: 'fix', create_time: String(Date.now()) })
+    for (let index = 0; index < LIVE_RETRY_LIMIT + 2; index++) queueLiveEvent(ctx, line(`om_${index}`))
+    expect(h.store.get<unknown[]>('feishu-live-retry')).toHaveLength(LIVE_RETRY_LIMIT)
+    // Each event past the limit drops the oldest one, and the health names that drop.
+    expect(h.health.feishu).toMatchObject({ state: 'error', detail: `1 kept Feishu event dropped after ${LIVE_RETRY_LIMIT} failures` })
+    // A day after its first failure a kept event is abandoned rather than retried for ever, and the health names the count.
+    const kept = h.store.get<{ line: string; failedAt: string; attempts: number }[]>('feishu-live-retry')!
+    h.store.set('feishu-live-retry', kept.map(item => ({ ...item, failedAt: new Date(Date.now() - 25 * 3600_000).toISOString() })))
+    expect(await retryLiveEvents(ctx)).toBe(0)
+    expect(h.store.get('feishu-live-retry')).toBeUndefined()
+    expect(h.health.feishu).toMatchObject({ state: 'error', detail: expect.stringContaining('abandoned after a day of failed retries') })
     h.store.close()
   })
   it('waits a second before restarting the event consumer after a run that stayed up for a minute, and backs off otherwise', () => {
@@ -599,19 +725,20 @@ describe('github source', () => {
     expect(h.store.threads.get('github:12')!.meta).not.toHaveProperty('pollError')
     h.store.close()
   })
-  it('drops an Issue GitHub reports as deleted after recording it, and reads one it answers 404 for again', async () => {
+  it('drops an Issue GitHub reports as deleted without a poll error on it, and reads one it answers 404 for again', async () => {
     const h = host()
     h.store.set('github-since', '2026-09-08T00:00:00.000Z')
     h.store.tickets.save(openTicket('t14'))
     h.store.threads.save({ key: 'github:14', ref: { source: 'github', id: '14' }, createdAt: '', lastAt: new Date().toISOString(),
-      subscriptions: ['t14'], correlated: [], pending: [], meta: { number: 14, isPr: false, title: 'Gone' } })
+      subscriptions: ['t14'], correlated: [], pending: [], meta: { number: 14, isPr: false, title: 'Gone', pollError: 'earlier failure' } })
     const deleted = refused(410, 'This issue was deleted')
     github(h, { notifications: [notification(14), notification(15)], 'issues/14': deleted, 'issues/15': deleted })
     await pollRound(h)
     expect(h.store.get('github-retry')).toEqual({})
     // Dropping a read moves no read position.
     expect(h.store.get('github-cursor:14')).toBeUndefined()
-    expect(h.store.threads.get('github:14')!.meta.pollError).toContain('deleted')
+    // A deleted Issue is a terminal state, not a failed read: it leaves no poll error, and one an earlier retry wrote is cleared.
+    expect(h.store.threads.get('github:14')!.meta).not.toHaveProperty('pollError')
     // Without a Thread to keep it, the Source's health names it.
     expect(h.health.github).toMatchObject({ state: 'ready', detail: '2 notifications; next poll ≥ 60s; deleted on GitHub: #14, #15' })
     // GitHub also answers 404 for a private repository the agent lost access to: that is a failure read again.
@@ -653,6 +780,63 @@ describe('github source', () => {
     const paths = calls.map(args => args[1]!.split('?')[0])
     expect(paths).toEqual(expect.arrayContaining(['repos/acme/widgets/issues/12', 'repos/acme/widgets/issues/13']))
     expect(h.health.github).toMatchObject({ state: 'ready', detail: '2 notifications; next poll ≥ 120s' })
+    h.store.close()
+  })
+  it('reads how long GitHub asks to wait for a rate limit, and backs off further on repeated limits', () => {
+    const now = 1_700_000_000_000
+    expect(rateLimitSeconds('HTTP/2.0 200 OK\r\nRetry-After: 120\r\n\r\n', now)).toBe(120)
+    expect(rateLimitSeconds(`Retry-After: ${new Date(now + 120_000).toUTCString()}\r\n`, now)).toBe(120)
+    // Once the hourly quota is spent, the wait is the time left until it returns; while some remains, it asks nothing.
+    expect(rateLimitSeconds('X-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000090\r\n', now)).toBe(90)
+    expect(rateLimitSeconds('X-RateLimit-Remaining: 42\r\nX-RateLimit-Reset: 1700000090\r\n', now)).toBeUndefined()
+    expect(rateLimitSeconds('HTTP/2.0 200 OK\r\n\r\n', now)).toBeUndefined()
+    // The longest wait between rounds caps what a response can ask for.
+    expect(rateLimitSeconds('Retry-After: 7200\r\n', now)).toBe(3600)
+    // A 403 or 429 rate limit backs off exponentially up to the cap; another failure does not back off.
+    const limited = () => refused(403, 'You have exceeded a secondary rate limit')
+    expect(limitBackoff(0, limited())).toBe(60)
+    expect(limitBackoff(60, limited())).toBe(120)
+    expect(limitBackoff(1800, limited())).toBe(3600)
+    expect(limitBackoff(3600, limited())).toBe(3600)
+    expect(limitBackoff(3600, refused(429, 'Too Many Requests'))).toBe(3600)
+    expect(limitBackoff(120, refused(502, 'Bad Gateway'))).toBe(0)
+    // A round that aggregates its steps' failures keeps the status in its text; it still counts as a limit.
+    expect(limitBackoff(0, new Error('1 GitHub reads failed: issues: gh: HTTP 403'))).toBe(60)
+  })
+  it('waits as long as a rate limit asks before the next round', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_700_000_000_000)
+    try {
+      const h = host()
+      h.store.set('github-since', '2026-09-08T00:00:00.000Z')
+      vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+        const path = args[1]!.replace(/^repos\/acme\/widgets\//, '').split('?')[0]!
+        if (path === 'notifications' && args.includes('--include')) {
+          return 'HTTP/2.0 200 OK\r\nX-Poll-Interval: 60\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Reset: 1700000090\r\n\r\n[]'
+        }
+        if (path === 'notifications') return JSON.stringify([])
+        return JSON.stringify(args.includes('--slurp') ? [[]] : [])
+      })
+      expect(await pollRound(h)).toBe(90)
+      expect(h.health.github).toMatchObject({ state: 'ready', detail: '0 notifications; next poll ≥ 90s' })
+      h.store.close()
+    } finally { vi.mocked(Date.now).mockRestore() }
+  })
+  it('names the notifications whose threads it does not read instead of skipping them silently', async () => {
+    const h = host()
+    h.store.set('github-since', '2026-09-08T00:00:00.000Z')
+    const subject = (url: string) => ({ id: `n-${url}`, updated_at: '2026-09-09T00:00:00Z', reason: 'mention',
+      repository: { full_name: 'acme/widgets' }, subject: { url, type: 'Commit', title: '' } })
+    github(h, { notifications: [
+      subject('https://api.github.com/repos/acme/widgets/commits/abc'),
+      // A review comment thread addresses a PR, but the comment itself is a discussion this Source does not read.
+      subject('https://github.com/acme/widgets/pull/7#discussion_r5'),
+      // A notification of another repository is not this Source's to read, and is not counted.
+      { ...subject('https://api.github.com/repos/acme/gadgets/issues/9'), repository: { full_name: 'acme/gadgets' } },
+    ] })
+    await pollRound(h)
+    expect(h.receive).not.toHaveBeenCalled()
+    expect(h.health.github).toMatchObject({ state: 'ready',
+      detail: '3 notifications; next poll ≥ 60s; 2 notifications of threads this Source does not read' })
     h.store.close()
   })
   it('drops a notified Issue whose reads fail for a day, so the Source leaves the error, and keeps its read position', async () => {
@@ -747,7 +931,9 @@ describe('github source', () => {
     })
     await expect(pollRound(h)).rejects.toThrow(/#8: .*502/)
     expect(h.store.threads.get('github:8')!.meta.pollError).toContain('502')
-    expect(h.store.threads.get('github:7')!.meta.pollError).toContain('410')
+    // A deleted Issue or PR leaves no poll error on its Thread, whether the read came from a ticket's PR or a subscribed Thread.
+    expect(h.store.threads.get('github:7')!.meta).not.toHaveProperty('pollError')
+    expect(h.store.threads.get('github:5')!.meta).not.toHaveProperty('pollError')
     vi.mocked(h.commands.run).mockImplementation(async (_program, args) => {
       const path = args[1]!.replace(/^repos\/acme\/widgets\//, '').split('?')[0]!
       if (path === 'notifications') return 'HTTP/2.0 200 OK\r\n\r\n[]'
@@ -1026,7 +1212,9 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
     observePulls: false, observeComments: false, observeCi: false })
 })
-describe('feishu event consumer', () => {
+// The fake bot CLI is a POSIX shell script, so this group cannot run on Windows; the loops it drives are covered there by
+// the unit tests above, which take the same functions without spawning a process.
+describe.skipIf(process.platform === 'win32')('feishu event consumer', () => {
   let dir: string
   let controller: AbortController
   let running: Promise<unknown> | undefined
@@ -1287,6 +1475,20 @@ describe('observing the GitHub repository', () => {
     expect(h.store.get('github-stream:issues')).toEqual({ since: at(0), started: { issues: at(0) } })
     expect(h.receive).toHaveBeenCalledWith(expect.objectContaining({ text: 'looks off' }))
     expect(h.store.get('github-stream:comments')).toEqual({ since: cursorAt(at(1)), started: { comments: at(0) } })
+    h.store.close()
+  })
+  it('waits as long as a rate-limited stream asks before the next round', async () => {
+    const h = host()
+    observe(h, { observeIssues: true })
+    vi.spyOn(h.commands, 'run').mockImplementation(async (_program, args) => {
+      const bare = args[1]!.replace(/^repos\/acme\/widgets\/?/, '').split('?')[0]!
+      if (bare === 'notifications') return 'HTTP/2.0 200 OK\r\n\r\n[]'
+      // A list answered under a rate limit asks for the wait on its own headers, not only the notifications do.
+      if (bare === 'issues') return 'HTTP/2.0 200 OK\r\nRetry-After: 300\r\n\r\n[]'
+      return JSON.stringify(args.includes('--slurp') ? [[]] : [])
+    })
+    expect(await pollRound(h)).toBe(300)
+    expect(h.store.get('github-stream:issues')).toMatchObject({ started: { issues: expect.any(String) } })
     h.store.close()
   })
   it('reads a stream whose cursor is older than the polling horizon from the horizon, without the ETag of the older request', async () => {
