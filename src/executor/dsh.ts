@@ -411,15 +411,15 @@ export class DshExecutor implements Executor {
   private launchFailed(ticketId: string, assignmentId: string, error: unknown): void {
     const ticket = this.host.store.tickets.get(ticketId)
     if (!ticket || !liveTicket(ticket) || latestAssignment(ticket)?.id !== assignmentId) return
-    this.failed(ticketId, String(error))
+    this.failed(ticketId, assignmentId, String(error))
   }
-  /** Records a `failed` report on the ticket and relays the failure to the main Session in one transaction. */
-  private failed(ticketId: string, summary: string): void {
+  /** Records a `failed` report about `assignmentId` on the ticket and relays the failure to the main Session in one transaction. */
+  private failed(ticketId: string, assignmentId: string, summary: string): void {
     this.host.store.atomic(() => {
       const stored = this.host.store.tickets.get(ticketId)
       // A ticket that ended meanwhile reports nothing: the Engine refuses a report on it, and that refusal is not a worker failure.
       if (!stored || !liveTicket(stored)) return
-      const updated = this.host.engine.report(ticketId, { state: 'failed', summary })
+      const updated = this.host.engine.report(ticketId, { assignmentId, state: 'failed', summary })
       this.relay(resultRelay(updated, 'failed', summary))
     })
   }
@@ -511,7 +511,7 @@ export class DshExecutor implements Executor {
       const assignment = ticket && runningAssignment(ticket)
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()) return
       if (this.retries(assignment.id, error)) { this.resumeAfter(ticket.id, assignment.id, error); return }
-      void this.background(Promise.resolve().then(() => { this.failed(ticket.id, String(error)) }))
+      void this.background(Promise.resolve().then(() => { this.failed(ticket.id, assignment.id, String(error)) }))
     }))
   }
   /** Unsubscribes from host agent events and clears any pending transient-retry timers. */
@@ -574,7 +574,7 @@ export class DshExecutor implements Executor {
       }
       const sent = this.host.sessions.prompt(sessionId, `retry:${assignmentId}:${tries}`, text, 'queue')
       void this.background(sent.finally(() => { if (waking) this.slots.free(ticketId); this.resuming.delete(assignmentId) })
-        .catch(failure => { this.failed(ticketId, String(failure)) }))
+        .catch(failure => { this.failed(ticketId, assignmentId, String(failure)) }))
     }
     this.after(TRANSIENT_BACKOFF_MS * 2 ** (tries - 1), go)
   }
@@ -666,7 +666,7 @@ export class DshExecutor implements Executor {
     const said = [text, stopped].filter(Boolean).join('\n\n')
     this.host.store.atomic(() => {
       const before = latestReport(current)?.summary ?? ''
-      const updated = this.host.engine.report(ticket.id, { state: 'waiting', summary: said || before })
+      const updated = this.host.engine.report(ticket.id, { assignmentId: idle.id, state: 'waiting', summary: said || before })
       // A quiet final after orchestrator_report is not a new status or an empty handoff.
       if (said) this.relay(resultRelay(updated, 'waiting', said))
       else if (!before.trim()) {

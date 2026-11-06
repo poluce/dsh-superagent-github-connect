@@ -9,6 +9,8 @@ import { automatic, type Tickets } from './tickets.ts'
 
 /** What an Assignment reports: a worker's report, or the Executor's own (`waiting` after an idle turn, `failed` after an error). */
 export interface WorkerReport {
+  /** The Assignment the report is about: the one its worker runs, or the one whose launch failed. */
+  assignmentId: string
   state: ReportState
   summary: string
   /** Open question for a person: a string asks it, `null` clears an open one, and `undefined` keeps the current one. */
@@ -91,10 +93,12 @@ export class Assignments extends EnginePart {
     else if (ticket.undelivered.length) this.options.executor.deliver(ticket, running)
   }
   /**
-   * Records a worker status report on an open ticket's current assignment, updating `attention`, `answers`, held automated
-   * inputs, and ending the ticket when `dropped` or when `ready` and not waiting on followed threads (`followsDone`).
-   * @throws UserError for an unknown or ended ticket, an ended assignment, a question combined with a ready result or answer,
-   * or a question/answer referencing a non-human or unreached trigger.
+   * Records a worker status report on the open ticket's Assignment `report.assignmentId`, updating `attention`, `answers`,
+   * held automated inputs, and ending the ticket when `dropped` or when `ready` and not waiting on followed threads
+   * (`followsDone`).
+   * @throws UserError for an unknown or ended ticket, a report naming an Assignment that is not the one it may report on
+   * (`assignmentEnded`: one that ended, or one a retry, restart or end replaced) or none at all (`unknownAssignment`), a
+   * question combined with a ready result or answer, or a question/answer referencing a non-human or unreached trigger.
    */
   report(ticketId: string, report: WorkerReport): Ticket {
     const ticket = this.require(ticketId)
@@ -107,9 +111,13 @@ export class Assignments extends EnginePart {
     }
     if (report.askedBy && !person(report.askedBy, true)) throw new UserError('notAsker')
     if (report.answers && !person(report.answers, false)) throw new UserError('notAnswerable')
-    const assignment = runningAssignment(ticket) ?? latestAssignment(ticket)
+    // A report is about one Assignment: its worker's, or the latest one while none runs, whose launch reports its failure. One
+    // a retry, restart or end replaced is late, and lands on no other Assignment.
+    const assignment = ticket.assignments.find(item => item.id === report.assignmentId)
     if (!assignment) throw new UserError('unknownAssignment')
-    if (assignment.state === 'ended') throw new UserError('assignmentEnded')
+    const running = runningAssignment(ticket)
+    if (assignment.state === 'ended' || assignment.id !== (running?.id ?? latestAssignment(ticket)?.id))
+      throw new UserError('assignmentEnded')
     const at = this.now()
     const previous = ticket.attention
     const ask = (question: string) => ({ id: key('attention', ticketId, question, at), question, ...(report.askedBy ? { triggerId: report.askedBy } : {}) })

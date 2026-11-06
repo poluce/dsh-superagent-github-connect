@@ -684,7 +684,7 @@ it('retries only a failed, blocked or undelivered ticket with a new assignment, 
   // The worker's Session holds the assignment, so the new one says only that a person retried it.
   expect(relays(`worker-${ticket.id}`).at(-1)).toEqual({ ticket_id: ticket.id, assignment: 2, note: expect.stringContaining('A person retried this ticket') })
   // A Session someone deleted gets the whole first message again with the next Assignment.
-  runtime.store.atomic(() => { runtime.engine.report(ticket.id, { state: 'failed', summary: 'LlmError: offline' }) })
+  runtime.store.atomic(() => { runtime.engine.report(ticket.id, { assignmentId: runtime.store.tickets.get(ticket.id)!.assignments.at(-1)!.id, state: 'failed', summary: 'LlmError: offline' }) })
   agents.delete(`worker-${ticket.id}`)
   runtime.engine.retryTicket(ticket.id)
   await runtime.idle()
